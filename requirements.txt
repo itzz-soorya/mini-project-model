@@ -1,0 +1,15 @@
+# Core Dependencies
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Dataset Download
+kagglehub>=0.2.0
+
+# Age Detection (Optional - only needed if ENABLE_AGE_DETECTION=True)
+deepface>=0.0.79
+tf-keras>=2.15.0
+
+# Additional dependencies
+pillow>=10.0.0
+pyyaml>=6.0
