@@ -211,16 +211,17 @@ while True:
                 if person_crop.size == 0:
                     continue
 
-                # ---------- FACE FILTER (if cascade loaded) ----------
-                if face_cascade is not None:
+                # ---------- FACE FILTER (only if age detection is enabled) ----------
+                if ENABLE_AGE_DETECTION and face_cascade is not None:
                     gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(gray, 1.3, 5)
                     if len(faces) == 0:
                         continue
 
                 # ---------- AGE ESTIMATION ----------
-                child_detected = True
+                child_detected = True  # Default: detect all persons when age detection disabled
                 color = (0, 255, 0)
+                label = f"PERSON {conf:.2f}"
 
                 if ENABLE_AGE_DETECTION:
                     try:
@@ -241,32 +242,35 @@ while True:
                             label = f"ADULT ({int(age)})"
                             color = (0, 255, 0)
 
-                        cv2.putText(frame, label, (px1, py1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     except:
                         child_detected = False
-                else:
-                    cv2.putText(frame, f"PERSON {conf:.2f}", (px1, py1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        label = f"UNKNOWN {conf:.2f}"
+
+                cv2.putText(frame, label, (px1, py1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 # ---------- ZONE CHECK ----------
+                person_in_danger_zone = False
+                
                 if child_detected:
                     for zx1, zy1, zx2, zy2 in ZONES:
                         if px1 < zx2 and px2 > zx1 and py1 < zy2 and py2 > zy1:
+                            person_in_danger_zone = True
                             person_in_zone = True
                             cv2.putText(frame, "!!! ALERT !!!", (50, 50),
                                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
                             
-                            # Draw danger indicator
+                            # Draw RED bounding box for danger
                             cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 3)
 
                             if not alarm_triggered:
                                 play_alarm()
                                 alarm_triggered = True
                             break
-
-                if not person_in_zone or not child_detected:
-                    cv2.rectangle(frame, (px1, py1), (px2, py2), color, 2)
+                
+                # Draw GREEN bounding box if person NOT in danger zone
+                if not person_in_danger_zone:
+                    cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
 
         # Stop alarm if zone empty
         if not person_in_zone and alarm_triggered:
