@@ -7,7 +7,28 @@ from ultralytics import YOLO
 import cv2
 import winsound
 import os
+import serial
+import time
 from deepface import DeepFace
+
+# -------------------- ARDUINO SETUP --------------------
+
+ENABLE_ARDUINO_BUZZER = True  # Set to False to use system beep instead
+ARDUINO_PORT = "COM3"  # Change to your Arduino COM port (COM3, COM4, etc.)
+ARDUINO_BAUD = 9600
+
+arduino = None
+
+if ENABLE_ARDUINO_BUZZER:
+    try:
+        arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+        time.sleep(2)  # Wait for Arduino to initialize
+        print(f"✓ Arduino connected on {ARDUINO_PORT}")
+    except Exception as e:
+        print(f"⚠ Arduino connection failed: {e}")
+        print("  Falling back to system beep")
+        ENABLE_ARDUINO_BUZZER = False
+        arduino = None
 
 # -------------------- BUILD/LOAD MODEL --------------------
 
@@ -129,27 +150,45 @@ print("\nSTARTING APPLICATION...\n")
 # -------------------- HELPER FUNCTIONS --------------------
 
 def play_alarm():
-    """Play alarm sound"""
-    global alarm_path
-    try:
-        if alarm_path and os.path.exists(alarm_path):
-            winsound.PlaySound(
-                alarm_path,
-                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP
-            )
-        else:
-            # Use system beep as fallback
+    """Trigger 15V buzzer via Arduino"""
+    global arduino
+    
+    # IF-ELSE condition to check if Arduino is available
+    if ENABLE_ARDUINO_BUZZER and arduino:
+        try:
+            arduino.write(b'1')  # Send '1' to Arduino to turn ON buzzer
+            print("✓ Buzzer triggered (Arduino)")
+        except Exception as e:
+            print(f"Error sending to Arduino: {e}")
+            # Fallback to system beep
+            winsound.Beep(1000, 500)
+    else:
+        # Fallback to system beep if Arduino not available
+        try:
             winsound.Beep(1000, 500)  # 1000 Hz for 500ms
-    except Exception as e:
-        print(f"Warning: Could not play alarm - {e}")
+            print("✓ Alarm beep triggered (System)")
+        except Exception as e:
+            print(f"Warning: Could not play alarm - {e}")
 
 
 def stop_alarm():
-    """Stop alarm sound"""
-    try:
-        winsound.PlaySound(None, winsound.SND_PURGE)
-    except:
-        pass
+    """Stop 15V buzzer via Arduino"""
+    global arduino
+    
+    # IF-ELSE condition to check if Arduino is available
+    if ENABLE_ARDUINO_BUZZER and arduino:
+        try:
+            arduino.write(b'0')  # Send '0' to Arduino to turn OFF buzzer
+            print("✓ Buzzer stopped (Arduino)")
+        except Exception as e:
+            print(f"Error sending to Arduino: {e}")
+    else:
+        # Stop system beep
+        try:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+            print("✓ Alarm stopped (System)")
+        except:
+            pass
 
 
 # -------------------- MAIN LOOP --------------------
@@ -305,4 +344,13 @@ print("\nShutting down...")
 cap.release()
 cv2.destroyAllWindows()
 stop_alarm()
+
+# Close Arduino connection
+if arduino:
+    try:
+        arduino.close()
+        print("✓ Arduino connection closed")
+    except:
+        pass
+
 print("✓ Application closed")
