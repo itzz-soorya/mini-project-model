@@ -14,7 +14,7 @@ from deepface import DeepFace
 # -------------------- ARDUINO SETUP --------------------
 
 ENABLE_ARDUINO_BUZZER = True  # Set to False to use system beep instead
-ARDUINO_PORT = "COM3"  # Change to your Arduino COM port (COM3, COM4, etc.)
+ARDUINO_PORT = "COM5"  # ✓ Detected Arduino Nano on COM5
 ARDUINO_BAUD = 9600
 
 arduino = None
