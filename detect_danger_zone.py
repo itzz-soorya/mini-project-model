@@ -10,6 +10,7 @@ import os
 import serial
 import time
 import math
+import numpy as np
 from deepface import DeepFace
 
 # -------------------- ARDUINO SETUP --------------------
@@ -150,6 +151,101 @@ def draw_toolbar(frame):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 1, cv2.LINE_AA)
 
 
+# -------------------- MAX PEOPLE PER ZONE --------------------
+
+DEFAULT_MAX_PEOPLE = 0
+_next_zone_id = 1  # Simple incrementing id for each new zone
+
+
+def ask_max_people():
+    """
+    Small OpenCV popup dialog asking the user for the maximum number of
+    people allowed inside the zone that was just drawn.
+
+    - Digit keys build up the number.
+    - BACKSPACE removes the last digit.
+    - ENTER confirms the typed value.
+    - ESC, closing the window, or an empty/invalid entry falls back to
+      DEFAULT_MAX_PEOPLE (0).
+    """
+    win_name = "Max People Input"
+    input_str = ""
+
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+
+    result = DEFAULT_MAX_PEOPLE
+
+    while True:
+        popup = np.zeros((150, 420, 3), dtype=np.uint8)
+        cv2.putText(popup, "Maximum people allowed?", (15, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        cv2.putText(popup, input_str if input_str else "_", (15, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.putText(popup, "ENTER = confirm   ESC = default (0)", (15, 135),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+        cv2.imshow(win_name, popup)
+
+        # If the user closed the popup window directly, fall back to default
+        try:
+            if cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1:
+                result = DEFAULT_MAX_PEOPLE
+                break
+        except cv2.error:
+            result = DEFAULT_MAX_PEOPLE
+            break
+
+        key = cv2.waitKey(0) & 0xFF
+
+        if key == 27:  # ESC -> default
+            result = DEFAULT_MAX_PEOPLE
+            break
+
+        elif key == 13 or key == 10:  # ENTER -> confirm
+            if input_str == "":
+                result = DEFAULT_MAX_PEOPLE
+            else:
+                try:
+                    value = int(input_str)
+                    result = value if value >= 0 else DEFAULT_MAX_PEOPLE
+                except ValueError:
+                    result = DEFAULT_MAX_PEOPLE
+            break
+
+        elif key in (8, 127):  # BACKSPACE -> remove last digit
+            input_str = input_str[:-1]
+
+        elif 48 <= key <= 57:  # digits 0-9
+            if len(input_str) < 5:
+                input_str += chr(key)
+
+        # any other key is ignored
+
+    try:
+        cv2.destroyWindow(win_name)
+    except cv2.error:
+        pass
+
+    return result
+
+
+def finish_zone_with_limit(zone_data):
+    """
+    Called right after a shape (rectangle/circle/freehand) is finished.
+    Prompts for the maximum-people limit, tags the zone with an id,
+    and appends it to the global ZONES list.
+    """
+    global ZONES, _next_zone_id
+
+    max_people = ask_max_people()
+
+    zone_data["id"] = _next_zone_id
+    zone_data["maximum_people"] = max_people
+    _next_zone_id += 1
+
+    ZONES.append(zone_data)
+
+
 # -------------------- MOUSE CALLBACK --------------------
 
 def draw_zone(event, x, y, flags, param):
@@ -179,8 +275,8 @@ def draw_zone(event, x, y, flags, param):
         elif event == cv2.EVENT_LBUTTONUP:
             drawing = False
             current_zone = {"type": "rectangle", "x1": ix, "y1": iy, "x2": x, "y2": y}
-            ZONES.append(current_zone)
             current_zone = None
+            finish_zone_with_limit({"type": "rectangle", "x1": ix, "y1": iy, "x2": x, "y2": y})
 
     # ---------- CIRCLE ----------
     elif CURRENT_TOOL == "circle":
@@ -196,9 +292,8 @@ def draw_zone(event, x, y, flags, param):
         elif event == cv2.EVENT_LBUTTONUP:
             drawing = False
             radius = int(math.hypot(x - ix, y - iy))
-            current_zone = {"type": "circle", "cx": ix, "cy": iy, "radius": radius}
-            ZONES.append(current_zone)
             current_zone = None
+            finish_zone_with_limit({"type": "circle", "cx": ix, "cy": iy, "radius": radius})
 
     # ---------- FREEHAND ----------
     elif CURRENT_TOOL == "freehand":
@@ -215,7 +310,7 @@ def draw_zone(event, x, y, flags, param):
         elif event == cv2.EVENT_LBUTTONUP:
             drawing = False
             if len(freehand_points) > 1:
-                ZONES.append({"type": "freehand", "points": list(freehand_points)})
+                finish_zone_with_limit({"type": "freehand", "points": list(freehand_points)})
             freehand_points = []
             current_zone = None
 
@@ -292,7 +387,6 @@ def draw_shape(frame, zone, color, thickness):
     elif shape_type == "freehand":
         points = zone.get("points", [])
         if len(points) > 1:
-            import numpy as np
             pts_array = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(frame, [pts_array], isClosed=True, color=color, thickness=thickness)
 
@@ -346,6 +440,10 @@ while True:
 
         for zone in ZONES:
             draw_shape(frame, zone, (0, 0, 255), 2)
+            zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
+            zone_label = f"Zone {zone.get('id', '?')} (Max:{zone.get('maximum_people', 0)})"
+            cv2.putText(frame, zone_label, (zx1, max(zy1 - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
         if current_zone:
             draw_shape(frame, current_zone, (255, 0, 0), 1)
@@ -358,9 +456,8 @@ while True:
         results = model(frame)
         person_in_zone = False
 
-        # Draw locked zones
-        for zone in ZONES:
-            draw_shape(frame, zone, (0, 0, 255), 2)
+        # Boxes of every valid detected person this frame (for per-zone counting)
+        detected_person_boxes = []
 
         for r in results:
             for box in r.boxes:
@@ -427,33 +524,58 @@ while True:
                 cv2.putText(frame, label, (px1, py1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # ---------- ZONE CHECK ----------
-                person_in_danger_zone = False
-
+                # ---------- COLLECT FOR PER-ZONE COUNTING ----------
                 if child_detected:
-                    for zone in ZONES:
-                        if person_in_zone_check(px1, py1, px2, py2, zone):
-                            person_in_danger_zone = True
-                            person_in_zone = True
-                            cv2.putText(frame, "!!! ALERT !!!", (50, 50),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                    detected_person_boxes.append((px1, py1, px2, py2))
 
-                            # Draw RED bounding box for danger
-                            cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 3)
+        # ---------- PER-ZONE PEOPLE-LIMIT CHECK ----------
+        any_zone_exceeded = False
 
-                            if not alarm_triggered:
-                                play_alarm()
-                                alarm_triggered = True
-                            break
+        for zone in ZONES:
+            current_people = 0
+            for (px1, py1, px2, py2) in detected_person_boxes:
+                if person_in_zone_check(px1, py1, px2, py2, zone):
+                    current_people += 1
 
-                # Draw GREEN bounding box if person NOT in danger zone
-                if not person_in_danger_zone:
-                    cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 0), 2)
+            max_people = zone.get("maximum_people", 0)
+            zone_exceeded = current_people > max_people
 
-        # Stop alarm if zone empty
-        if not person_in_zone and alarm_triggered:
-            stop_alarm()
-            alarm_triggered = False
+            zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
+
+            if zone_exceeded:
+                any_zone_exceeded = True
+                person_in_zone = True
+
+                # Draw zone border RED and show LIMIT EXCEEDED
+                draw_shape(frame, zone, (0, 0, 255), 3)
+                cv2.putText(frame, "LIMIT EXCEEDED", (zx1, max(zy1 - 30, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(frame, "!!! ALERT !!!", (50, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            else:
+                # Keep zone border GREEN and show People : current/max
+                draw_shape(frame, zone, (0, 255, 0), 2)
+                cv2.putText(frame, f"People : {current_people}/{max_people}",
+                            (zx1, max(zy1 - 10, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+            # Highlight each person's box red/green based on whether their
+            # zone(s) are currently over the limit
+            for (px1, py1, px2, py2) in detected_person_boxes:
+                if person_in_zone_check(px1, py1, px2, py2, zone):
+                    box_color = (0, 0, 255) if zone_exceeded else (0, 255, 0)
+                    box_thickness = 3 if zone_exceeded else 2
+                    cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
+
+        if any_zone_exceeded:
+            if not alarm_triggered:
+                play_alarm()
+                alarm_triggered = True
+        else:
+            person_in_zone = False
+            if alarm_triggered:
+                stop_alarm()
+                alarm_triggered = False
 
     cv2.imshow("Child Safety Detector", frame)
 
@@ -472,6 +594,7 @@ while True:
     # R → Reset zones
     if key == ord('r'):
         ZONES.clear()
+        _next_zone_id = 1
         detection_started = False
         alarm_triggered = False
         stop_alarm()
