@@ -10,6 +10,9 @@ import os
 import serial
 import time
 import math
+import csv
+import datetime
+import json
 import numpy as np
 from deepface import DeepFace
 
@@ -57,7 +60,6 @@ face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
 if face_cascade.empty():
     # Try to load from OpenCV data directory
-    import cv2
     cascade_file = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
     face_cascade = cv2.CascadeClassifier(cascade_file)
 
@@ -79,6 +81,17 @@ if not cap.isOpened():
 
 print("✓ Camera initialized")
 
+# Save one reference snapshot for the HTML zone editor to draw zones on top
+# of. Grabbed once here (not every frame) since it's just a visual guide -
+# zone coordinates are what matter, and those are saved separately.
+SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zone_reference.jpg")
+_ok, _snap_frame = cap.read()
+if _ok:
+    cv2.imwrite(SNAPSHOT_FILE, _snap_frame)
+    print(f"✓ Reference snapshot saved: {SNAPSHOT_FILE}")
+else:
+    print("⚠ Could not capture reference snapshot for the HTML editor")
+
 # -------------------- ALARM --------------------
 
 alarm_path = os.path.join(os.path.dirname(__file__), "alarm.wav")
@@ -93,6 +106,20 @@ if not os.path.exists(alarm_path):
 
 ENABLE_AGE_DETECTION = False     # True → child-only mode
 AGE_THRESHOLD = 14
+
+# DeepFace age analysis is expensive (often 100-300ms per call). Running it
+# on every detected person on every single frame tanks real FPS. Instead,
+# only run it once every AGE_CHECK_INTERVAL frames; on the frames in
+# between, fall back to the last known age/child classification for that
+# detection area (or a safe "treat as person" default if none exists yet).
+AGE_CHECK_INTERVAL = 5
+frame_counter = 0
+
+# Cache of the last age-analysis result per rough screen position (grid
+# cell), so frames that skip the DeepFace call can still show a sensible
+# label/color instead of re-running the expensive analysis every frame.
+AGE_CACHE_GRID = 80  # pixels per grid cell
+age_result_cache = {}
 
 print("\n" + "=" * 60)
 print("CONFIGURATION")
@@ -111,6 +138,77 @@ current_zone = None
 
 alarm_triggered = False
 detection_started = False
+
+# zones.json lives next to this script. The HTML editor (zone_editor.html +
+# zone_server.py) reads and writes the same file, so zones created here in
+# OpenCV can be edited there, and edits made there are picked up here.
+ZONES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zones.json")
+
+
+def save_zones_to_file():
+    """Persist current ZONES + next id to zones.json."""
+    global _next_zone_id, _zones_mtime
+    try:
+        with open(ZONES_FILE, "w") as f:
+            json.dump({"next_zone_id": _next_zone_id, "zones": ZONES}, f, indent=2)
+        _zones_mtime = os.path.getmtime(ZONES_FILE)
+        print(f"✓ Zones saved to {ZONES_FILE}")
+    except Exception as e:
+        print(f"✗ Could not save zones.json: {e}")
+
+
+def load_zones_from_file():
+    """Load zones previously saved by this script, or edited via the HTML CRUD editor."""
+    global ZONES, _next_zone_id
+    if not os.path.exists(ZONES_FILE):
+        return
+    try:
+        with open(ZONES_FILE, "r") as f:
+            data = json.load(f)
+        ZONES = data.get("zones", [])
+        _next_zone_id = data.get("next_zone_id", len(ZONES) + 1)
+        print(f"✓ Loaded {len(ZONES)} zone(s) from {ZONES_FILE}")
+    except Exception as e:
+        print(f"✗ Could not load zones.json: {e}")
+
+
+# -------------------- LIVE ZONE HOT-RELOAD --------------------
+# Lets zones.json be edited via zone_editor.html while detect_danger_zone.py
+# is already running, without needing to restart the script. We only stat()
+# the file (cheap) every ZONE_RELOAD_CHECK_SECONDS, and only actually
+# re-parse/reload it if its modification time changed since the last check.
+
+ZONE_RELOAD_CHECK_SECONDS = 2.0
+_zones_mtime = os.path.getmtime(ZONES_FILE) if os.path.exists(ZONES_FILE) else 0
+_last_zone_check_time = 0.0
+
+
+def check_for_live_zone_updates():
+    """Call once per main-loop iteration. Reloads ZONES from disk if the
+    HTML editor (or another process) has saved a newer zones.json since we
+    last checked."""
+    global _zones_mtime, _last_zone_check_time
+
+    now = time.time()
+    if now - _last_zone_check_time < ZONE_RELOAD_CHECK_SECONDS:
+        return
+    _last_zone_check_time = now
+
+    if not os.path.exists(ZONES_FILE):
+        return
+
+    mtime = os.path.getmtime(ZONES_FILE)
+    if mtime == _zones_mtime:
+        return  # unchanged since last check
+
+    _zones_mtime = mtime
+
+    # Close out any in-progress incident recordings before swapping the
+    # zone list out from under them - old zone ids may no longer exist
+    # (or may now mean something different) after the reload.
+    finalize_all_active_incidents()
+    load_zones_from_file()
+    print("↻ zones.json changed on disk - live-reloaded zones")
 
 # -------------------- DRAWING TOOL SELECTOR --------------------
 
@@ -273,10 +371,10 @@ def draw_zone(event, x, y, flags, param):
                 current_zone = {"type": "rectangle", "x1": ix, "y1": iy, "x2": x, "y2": y}
 
         elif event == cv2.EVENT_LBUTTONUP:
-            drawing = False
-            current_zone = {"type": "rectangle", "x1": ix, "y1": iy, "x2": x, "y2": y}
-            current_zone = None
-            finish_zone_with_limit({"type": "rectangle", "x1": ix, "y1": iy, "x2": x, "y2": y})
+            if drawing:
+                drawing = False
+                current_zone = None
+                finish_zone_with_limit({"type": "rectangle", "x1": ix, "y1": iy, "x2": x, "y2": y})
 
     # ---------- CIRCLE ----------
     elif CURRENT_TOOL == "circle":
@@ -290,10 +388,11 @@ def draw_zone(event, x, y, flags, param):
                 current_zone = {"type": "circle", "cx": ix, "cy": iy, "radius": radius}
 
         elif event == cv2.EVENT_LBUTTONUP:
-            drawing = False
-            radius = int(math.hypot(x - ix, y - iy))
-            current_zone = None
-            finish_zone_with_limit({"type": "circle", "cx": ix, "cy": iy, "radius": radius})
+            if drawing:
+                drawing = False
+                radius = int(math.hypot(x - ix, y - iy))
+                current_zone = None
+                finish_zone_with_limit({"type": "circle", "cx": ix, "cy": iy, "radius": radius})
 
     # ---------- FREEHAND ----------
     elif CURRENT_TOOL == "freehand":
@@ -308,16 +407,25 @@ def draw_zone(event, x, y, flags, param):
                 current_zone = {"type": "freehand", "points": freehand_points}
 
         elif event == cv2.EVENT_LBUTTONUP:
-            drawing = False
-            if len(freehand_points) > 1:
-                finish_zone_with_limit({"type": "freehand", "points": list(freehand_points)})
-            freehand_points = []
-            current_zone = None
+            if drawing:
+                drawing = False
+                if len(freehand_points) > 1:
+                    finish_zone_with_limit({"type": "freehand", "points": list(freehand_points)})
+                freehand_points = []
+                current_zone = None
 
 
 cv2.namedWindow("Child Safety Detector", cv2.WINDOW_NORMAL)
 cv2.setWindowProperty("Child Safety Detector", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 cv2.setMouseCallback("Child Safety Detector", draw_zone)
+
+# Pick up zones saved from a previous run, or edited via the HTML CRUD
+# editor (zone_editor.html + zone_server.py), so you don't have to redraw
+# them by hand in OpenCV every time.
+load_zones_from_file()
+if ZONES:
+    print(f"\n✓ {len(ZONES)} zone(s) loaded from zones.json - press ENTER to use them as-is,")
+    print("  or draw more / edit further before confirming.")
 
 print("\n" + "=" * 60)
 print("INSTRUCTIONS")
@@ -413,206 +521,506 @@ def zone_bounding_box(zone):
     return 0, 0, 0, 0
 
 
+def zone_contains_point(x, y, zone):
+    """
+    Precise point-in-shape test for circle and freehand zones.
+    Circle: standard distance-from-center <= radius check.
+    Freehand: cv2.pointPolygonTest against the drawn outline (treated as a
+    closed polygon), so points outside the actual traced shape but inside
+    its bounding box are correctly excluded.
+    """
+    shape_type = zone.get("type")
+
+    if shape_type == "circle":
+        cx, cy, r = zone["cx"], zone["cy"], zone["radius"]
+        return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+    elif shape_type == "freehand":
+        points = zone.get("points", [])
+        if len(points) < 3:
+            return False
+        pts_array = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
+        return cv2.pointPolygonTest(pts_array, (float(x), float(y)), False) >= 0
+
+    return False
+
+
 def person_in_zone_check(px1, py1, px2, py2, zone):
     """
-    Check whether a detected person's bounding box overlaps the given zone.
-    Rectangle: standard box-overlap test (same logic as before).
-    Circle / Freehand: approximated using the zone's bounding box for overlap,
-    matching the original rectangle-overlap behavior for consistency.
+    Check whether a detected person is inside the given zone.
+    Rectangle: standard box-overlap test (unchanged from before).
+    Circle / Freehand: uses the person's foot-point (bottom-center of their
+    bounding box) tested against the ACTUAL shape geometry via
+    zone_contains_point, instead of approximating with the zone's bounding
+    box. This avoids false positives near the corners of a circle/freehand
+    zone's bounding rectangle where no real overlap exists.
     """
-    zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
-    return px1 < zx2 and px2 > zx1 and py1 < zy2 and py2 > zy1
+    shape_type = zone.get("type")
+
+    if shape_type == "rectangle":
+        zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
+        return px1 < zx2 and px2 > zx1 and py1 < zy2 and py2 > zy1
+
+    # Foot-point: bottom-center of the person's box, i.e. where they're
+    # standing. More representative of "is this person in the zone" than
+    # the full box for non-rectangular shapes.
+    foot_x = (px1 + px2) // 2
+    foot_y = py2
+    return zone_contains_point(foot_x, foot_y, zone)
+
+
+# ==================== SMART INCIDENT EVIDENCE STORAGE ====================
+#
+# Nothing here ever runs unless a zone actually exceeds its maximum-people
+# limit. No folders, files, or logs are created for a clean/compliant frame.
+
+EVIDENCE_ROOT = "evidence"
+CSV_FIELDNAMES = [
+    "Date", "Time", "Zone ID", "Zone Name",
+    "People Count", "Allowed Count", "Image", "Video", "Status",
+]
+
+# Per-zone incident state, keyed by zone id. Only populated once a zone's
+# FIRST violation happens.
+zone_incident_state = {}
+
+
+def get_zone_display_name(zone):
+    """Human-readable zone name; falls back to Zone<id> if none was set."""
+    name = zone.get("name")
+    return name if name else f"Zone{zone.get('id', '?')}"
+
+
+def sanitize_for_filename(name):
+    """Strip spaces/punctuation so the name is safe to use in a filename."""
+    cleaned = "".join(ch for ch in name if ch.isalnum())
+    return cleaned if cleaned else "Zone"
+
+
+def ensure_day_folders(date_str):
+    """
+    Create evidence/<date>/images and evidence/<date>/videos.
+    Only ever called at the moment a new incident actually starts.
+    """
+    day_dir = os.path.join(EVIDENCE_ROOT, date_str)
+    images_dir = os.path.join(day_dir, "images")
+    videos_dir = os.path.join(day_dir, "videos")
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(videos_dir, exist_ok=True)
+    return day_dir, images_dir, videos_dir
+
+
+def start_incident(zone, current_people, evidence_frame):
+    """Begin a brand-new incident for this zone: snapshot + video start."""
+    zone_id = zone.get("id")
+    zone_name = get_zone_display_name(zone)
+    safe_name = sanitize_for_filename(zone_name)
+
+    now = datetime.datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    file_time_str = now.strftime("%H-%M-%S")
+    log_time_str = now.strftime("%H:%M:%S")
+
+    _, images_dir, videos_dir = ensure_day_folders(date_str)
+
+    image_filename = f"{safe_name}_{file_time_str}.jpg"
+    video_filename = f"{safe_name}_{file_time_str}.mp4"
+    image_path = os.path.join(images_dir, image_filename)
+    video_path = os.path.join(videos_dir, video_filename)
+
+    cv2.imwrite(image_path, evidence_frame)
+
+    h, w = evidence_frame.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (w, h))
+
+    zone_incident_state[zone_id] = {
+        "active": True,
+        "date": date_str,
+        "time": log_time_str,
+        "zone_name": zone_name,
+        "max_allowed": zone.get("maximum_people", 0),
+        "peak_count": current_people,
+        "image_filename": image_filename,
+        "video_filename": video_filename,
+        "video_writer": video_writer,
+    }
+
+    if video_writer.isOpened():
+        video_writer.write(evidence_frame)
+
+
+def continue_incident(zone_id, current_people, evidence_frame):
+    """Keep recording the ongoing incident and track its peak headcount."""
+    state = zone_incident_state.get(zone_id)
+    if not state or not state["active"]:
+        return
+
+    state["peak_count"] = max(state["peak_count"], current_people)
+
+    writer = state.get("video_writer")
+    if writer is not None and writer.isOpened():
+        writer.write(evidence_frame)
+
+
+def update_summary(date_str):
+    """Rebuild summary.txt for a day from that day's incident_log.csv."""
+    day_dir = os.path.join(EVIDENCE_ROOT, date_str)
+    csv_path = os.path.join(day_dir, "incident_log.csv")
+    summary_path = os.path.join(day_dir, "summary.txt")
+
+    if not os.path.exists(csv_path):
+        return
+
+    with open(csv_path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        return
+
+    zones_summary = {}
+    all_times = []
+
+    for row in rows:
+        zid = row["Zone ID"]
+        people = int(row["People Count"])
+        allowed = int(row["Allowed Count"])
+        all_times.append(row["Time"])
+
+        if zid not in zones_summary:
+            zones_summary[zid] = {
+                "name": row["Zone Name"],
+                "violations": 0,
+                "max_allowed": allowed,
+                "highest_count": people,
+            }
+
+        info = zones_summary[zid]
+        info["violations"] += 1
+        info["max_allowed"] = allowed
+        info["highest_count"] = max(info["highest_count"], people)
+
+    lines = [f"Date : {date_str}", f"Total Incidents : {len(rows)}", "-" * 50]
+
+    for zid in sorted(zones_summary.keys(), key=lambda v: int(v) if v.isdigit() else v):
+        info = zones_summary[zid]
+        lines.append(f"Zone {zid} ({info['name']})")
+        lines.append(f"Violations : {info['violations']}")
+        lines.append(f"Maximum People Allowed : {info['max_allowed']}")
+        lines.append(f"Highest People Count : {info['highest_count']}")
+        lines.append("-" * 50)
+
+    lines.append(f"First Incident : {min(all_times)}")
+    lines.append(f"Last Incident : {max(all_times)}")
+
+    with open(summary_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def finalize_incident(zone_id):
+    """Close the video, append the CSV row, and refresh summary.txt."""
+    state = zone_incident_state.get(zone_id)
+    if not state or not state["active"]:
+        return
+
+    writer = state.get("video_writer")
+    if writer is not None:
+        try:
+            writer.release()
+        except Exception:
+            pass
+
+    date_str = state["date"]
+    day_dir = os.path.join(EVIDENCE_ROOT, date_str)
+    csv_path = os.path.join(day_dir, "incident_log.csv")
+
+    row = {
+        "Date": date_str,
+        "Time": state["time"],
+        "Zone ID": zone_id,
+        "Zone Name": state["zone_name"],
+        "People Count": state["peak_count"],
+        "Allowed Count": state["max_allowed"],
+        "Image": state["image_filename"],
+        "Video": state["video_filename"],
+        "Status": "VIOLATION",
+    }
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        csv_writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        if write_header:
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+
+    update_summary(date_str)
+
+    state["active"] = False
+
+
+def handle_zone_incident(zone, zone_exceeded, current_people, evidence_frame):
+    """
+    Called once per zone per frame. Starts / continues / finalizes an
+    incident purely based on whether the zone is currently over its limit.
+    A brand-new image + video are only created once the PREVIOUS incident
+    for that zone has ended and a new violation begins.
+    """
+    zone_id = zone.get("id")
+    state = zone_incident_state.get(zone_id)
+
+    if zone_exceeded:
+        if state is None or not state["active"]:
+            start_incident(zone, current_people, evidence_frame)
+        else:
+            continue_incident(zone_id, current_people, evidence_frame)
+    else:
+        if state is not None and state["active"]:
+            finalize_incident(zone_id)
+
+
+def finalize_all_active_incidents():
+    """Called on shutdown so no in-progress incident is left un-logged."""
+    for zone_id, state in list(zone_incident_state.items()):
+        if state.get("active"):
+            finalize_incident(zone_id)
 
 
 # -------------------- MAIN LOOP --------------------
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    # ========= DRAW MODE =========
-    if not detection_started:
-        cv2.putText(frame, "DRAW DANGER ZONES", (150, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-        cv2.putText(frame, "Press ENTER to CONFIRM", (150, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # Pick up zone edits saved from zone_editor.html while this script
+        # is already running (throttled internally - see
+        # ZONE_RELOAD_CHECK_SECONDS - so this is cheap to call every frame).
+        check_for_live_zone_updates()
 
-        for zone in ZONES:
-            draw_shape(frame, zone, (0, 0, 255), 2)
-            zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
-            zone_label = f"Zone {zone.get('id', '?')} (Max:{zone.get('maximum_people', 0)})"
-            cv2.putText(frame, zone_label, (zx1, max(zy1 - 10, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        # ========= DRAW MODE =========
+        if not detection_started:
+            cv2.putText(frame, "DRAW DANGER ZONES", (150, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            cv2.putText(frame, "Press ENTER to CONFIRM", (150, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        if current_zone:
-            draw_shape(frame, current_zone, (255, 0, 0), 1)
+            for zone in ZONES:
+                draw_shape(frame, zone, (0, 0, 255), 2)
+                zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
+                zone_label = f"Zone {zone.get('id', '?')} (Max:{zone.get('maximum_people', 0)})"
+                cv2.putText(frame, zone_label, (zx1, max(zy1 - 10, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-        # Toolbar drawn last so it stays on top
-        draw_toolbar(frame)
+            if current_zone:
+                draw_shape(frame, current_zone, (255, 0, 0), 1)
 
-    # ========= DETECTION MODE =========
-    else:
-        results = model(frame)
-        person_in_zone = False
+            # Toolbar drawn last so it stays on top
+            draw_toolbar(frame)
 
-        # Boxes of every valid detected person this frame (for per-zone counting)
-        detected_person_boxes = []
+        # ========= DETECTION MODE =========
+        else:
+            frame_counter += 1
+            results = model(frame)
 
-        for r in results:
-            for box in r.boxes:
-                cls = int(box.cls[0])
-                if model.names[cls] != "person":
-                    continue
+            # Clean snapshot of the raw camera frame, taken before any overlays
+            # are drawn, so incident evidence images/video are not cluttered.
+            evidence_frame = frame.copy()
 
-                px1, py1, px2, py2 = map(int, box.xyxy[0])
-                conf = float(box.conf[0])
+            # Boxes of every valid detected person this frame (for per-zone counting)
+            detected_person_boxes = []
 
-                # ---------- BASIC CONFIDENCE FILTER ----------
-                if conf < 0.6:
-                    continue
-
-                w = px2 - px1
-                h = py2 - py1
-                if w == 0 or h == 0:
-                    continue
-
-                # ---------- ASPECT RATIO FILTER ----------
-                aspect_ratio = h / w
-                if aspect_ratio > 4 or aspect_ratio < 1:
-                    continue
-
-                person_crop = frame[py1:py2, px1:px2]
-                if person_crop.size == 0:
-                    continue
-
-                # ---------- FACE FILTER (only if age detection is enabled) ----------
-                if ENABLE_AGE_DETECTION and face_cascade is not None:
-                    gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-                    if len(faces) == 0:
+            for r in results:
+                for box in r.boxes:
+                    cls = int(box.cls[0])
+                    if model.names[cls] != "person":
                         continue
 
-                # ---------- AGE ESTIMATION ----------
-                child_detected = True  # Default: detect all persons when age detection disabled
-                color = (0, 255, 0)
-                label = f"PERSON {conf:.2f}"
+                    px1, py1, px2, py2 = map(int, box.xyxy[0])
+                    conf = float(box.conf[0])
 
-                if ENABLE_AGE_DETECTION:
-                    try:
-                        result = DeepFace.analyze(
-                            person_crop,
-                            actions=['age'],
-                            enforce_detection=False,
-                            silent=True
-                        )
-                        age = result[0]['age']
+                    # ---------- BASIC CONFIDENCE FILTER ----------
+                    if conf < 0.6:
+                        continue
 
-                        if age < AGE_THRESHOLD:
-                            child_detected = True
-                            label = f"CHILD ({int(age)})"
-                            color = (0, 0, 255)
+                    w = px2 - px1
+                    h = py2 - py1
+                    if w == 0 or h == 0:
+                        continue
+
+                    # ---------- ASPECT RATIO FILTER ----------
+                    # Skip the filter for boxes touching the frame edge - they're
+                    # partially cropped, so their aspect ratio is unreliable and
+                    # shouldn't be used to reject a real detection.
+                    frame_h, frame_w = frame.shape[:2]
+                    touches_edge = (px1 <= 1 or py1 <= 1 or
+                                     px2 >= frame_w - 1 or py2 >= frame_h - 1)
+
+                    if not touches_edge:
+                        aspect_ratio = h / w
+                        # Widened lower bound (was 1) so crouching/bending/seated
+                        # people aren't discarded just for being wider than tall.
+                        if aspect_ratio > 4 or aspect_ratio < 0.5:
+                            continue
+
+                    person_crop = frame[py1:py2, px1:px2]
+                    if person_crop.size == 0:
+                        continue
+
+                    # ---------- FACE FILTER (only if age detection is enabled) ----------
+                    if ENABLE_AGE_DETECTION and face_cascade is not None:
+                        gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+                        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+                        if len(faces) == 0:
+                            continue
+
+                    # ---------- AGE ESTIMATION ----------
+                    child_detected = True  # Default: detect all persons when age detection disabled
+                    color = (0, 255, 0)
+                    label = f"PERSON {conf:.2f}"
+
+                    if ENABLE_AGE_DETECTION:
+                        # Grid cell key for this person's rough position, used to
+                        # cache their last age result between throttled checks.
+                        grid_key = (px1 // AGE_CACHE_GRID, py1 // AGE_CACHE_GRID)
+                        run_deepface = (frame_counter % AGE_CHECK_INTERVAL == 0) or (grid_key not in age_result_cache)
+
+                        if run_deepface:
+                            try:
+                                result = DeepFace.analyze(
+                                    person_crop,
+                                    actions=['age'],
+                                    enforce_detection=False,
+                                    silent=True
+                                )
+                                age = result[0]['age']
+
+                                if age < AGE_THRESHOLD:
+                                    child_detected = True
+                                    label = f"CHILD ({int(age)})"
+                                    color = (0, 0, 255)
+                                else:
+                                    child_detected = False
+                                    label = f"ADULT ({int(age)})"
+                                    color = (0, 255, 0)
+
+                            except:
+                                child_detected = False
+                                label = f"UNKNOWN {conf:.2f}"
+
+                            age_result_cache[grid_key] = (child_detected, label, color)
+
                         else:
-                            child_detected = False
-                            label = f"ADULT ({int(age)})"
-                            color = (0, 255, 0)
+                            # Reuse the last known result for this position
+                            # instead of re-running DeepFace every frame.
+                            child_detected, label, color = age_result_cache[grid_key]
 
-                    except:
-                        child_detected = False
-                        label = f"UNKNOWN {conf:.2f}"
+                    cv2.putText(frame, label, (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                cv2.putText(frame, label, (px1, py1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    # ---------- COLLECT FOR PER-ZONE COUNTING ----------
+                    if child_detected:
+                        detected_person_boxes.append((px1, py1, px2, py2))
 
-                # ---------- COLLECT FOR PER-ZONE COUNTING ----------
-                if child_detected:
-                    detected_person_boxes.append((px1, py1, px2, py2))
+            # ---------- PER-ZONE PEOPLE-LIMIT CHECK ----------
+            any_zone_exceeded = False
 
-        # ---------- PER-ZONE PEOPLE-LIMIT CHECK ----------
-        any_zone_exceeded = False
+            for zone in ZONES:
+                current_people = 0
+                for (px1, py1, px2, py2) in detected_person_boxes:
+                    if person_in_zone_check(px1, py1, px2, py2, zone):
+                        current_people += 1
 
-        for zone in ZONES:
-            current_people = 0
-            for (px1, py1, px2, py2) in detected_person_boxes:
-                if person_in_zone_check(px1, py1, px2, py2, zone):
-                    current_people += 1
+                max_people = zone.get("maximum_people", 0)
+                zone_exceeded = current_people > max_people
 
-            max_people = zone.get("maximum_people", 0)
-            zone_exceeded = current_people > max_people
+                zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
 
-            zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
+                if zone_exceeded:
+                    any_zone_exceeded = True
 
-            if zone_exceeded:
-                any_zone_exceeded = True
-                person_in_zone = True
+                    # Draw zone border RED and show LIMIT EXCEEDED
+                    draw_shape(frame, zone, (0, 0, 255), 3)
+                    cv2.putText(frame, "LIMIT EXCEEDED", (zx1, max(zy1 - 30, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.putText(frame, "!!! ALERT !!!", (50, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                else:
+                    # Keep zone border GREEN and show People : current/max
+                    draw_shape(frame, zone, (0, 255, 0), 2)
+                    cv2.putText(frame, f"People : {current_people}/{max_people}",
+                                (zx1, max(zy1 - 10, 15)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-                # Draw zone border RED and show LIMIT EXCEEDED
-                draw_shape(frame, zone, (0, 0, 255), 3)
-                cv2.putText(frame, "LIMIT EXCEEDED", (zx1, max(zy1 - 30, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                cv2.putText(frame, "!!! ALERT !!!", (50, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                # ---------- INCIDENT EVIDENCE (only on actual violation) ----------
+                handle_zone_incident(zone, zone_exceeded, current_people, evidence_frame)
+
+                # Highlight each person's box red/green based on whether their
+                # zone(s) are currently over the limit
+                for (px1, py1, px2, py2) in detected_person_boxes:
+                    if person_in_zone_check(px1, py1, px2, py2, zone):
+                        box_color = (0, 0, 255) if zone_exceeded else (0, 255, 0)
+                        box_thickness = 3 if zone_exceeded else 2
+                        cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
+
+            if any_zone_exceeded:
+                if not alarm_triggered:
+                    play_alarm()
+                    alarm_triggered = True
             else:
-                # Keep zone border GREEN and show People : current/max
-                draw_shape(frame, zone, (0, 255, 0), 2)
-                cv2.putText(frame, f"People : {current_people}/{max_people}",
-                            (zx1, max(zy1 - 10, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                if alarm_triggered:
+                    stop_alarm()
+                    alarm_triggered = False
 
-            # Highlight each person's box red/green based on whether their
-            # zone(s) are currently over the limit
-            for (px1, py1, px2, py2) in detected_person_boxes:
-                if person_in_zone_check(px1, py1, px2, py2, zone):
-                    box_color = (0, 0, 255) if zone_exceeded else (0, 255, 0)
-                    box_thickness = 3 if zone_exceeded else 2
-                    cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
+        cv2.imshow("Child Safety Detector", frame)
 
-        if any_zone_exceeded:
-            if not alarm_triggered:
-                play_alarm()
-                alarm_triggered = True
-        else:
-            person_in_zone = False
-            if alarm_triggered:
-                stop_alarm()
-                alarm_triggered = False
+        key = cv2.waitKey(1) & 0xFF
 
-    cv2.imshow("Child Safety Detector", frame)
+        # ESC → Exit
+        if key == 27:
+            break
 
-    key = cv2.waitKey(1) & 0xFF
+        # ENTER → Confirm zones
+        if key == 13 and not detection_started:
+            if len(ZONES) > 0:
+                detection_started = True
+                save_zones_to_file()
+                print(f"\n✓ Detection started with {len(ZONES)} danger zone(s)")
 
-    # ESC → Exit
-    if key == 27:
-        break
+        # R → Reset zones
+        if key == ord('r'):
+            finalize_all_active_incidents()
+            ZONES.clear()
+            _next_zone_id = 1
+            detection_started = False
+            alarm_triggered = False
+            stop_alarm()
+            save_zones_to_file()
+            print("\n✓ Zones reset - draw new zones")
 
-    # ENTER → Confirm zones
-    if key == 13 and not detection_started:
-        if len(ZONES) > 0:
-            detection_started = True
-            print(f"\n✓ Detection started with {len(ZONES)} danger zone(s)")
+except Exception as e:
+    print(f"\n✗ Unexpected error: {e}")
 
-    # R → Reset zones
-    if key == ord('r'):
-        ZONES.clear()
-        _next_zone_id = 1
-        detection_started = False
-        alarm_triggered = False
-        stop_alarm()
-        print("\n✓ Zones reset - draw new zones")
+finally:
+    # -------------------- CLEAN EXIT --------------------
+    # This block always runs - even if the loop above crashed - so the
+    # camera, Arduino connection, and any in-progress incident recording
+    # are never left open/corrupted.
+    print("\nShutting down...")
 
-# -------------------- CLEAN EXIT --------------------
+    # Close out any incident that was still active when the app was closed
+    finalize_all_active_incidents()
 
-print("\nShutting down...")
-cap.release()
-cv2.destroyAllWindows()
-stop_alarm()
+    cap.release()
+    cv2.destroyAllWindows()
+    stop_alarm()
 
-# Close Arduino connection
-if arduino:
-    try:
-        arduino.close()
-        print("✓ Arduino connection closed")
-    except:
-        pass
+    # Close Arduino connection
+    if arduino:
+        try:
+            arduino.close()
+            print("✓ Arduino connection closed")
+        except:
+            pass
 
-print("✓ Application closed")
+    print("✓ Application closed")

@@ -1,0 +1,49 @@
+{
+  "next_zone_id": 4,
+  "zones": [
+    {
+      "cx": 184,
+      "cy": 315,
+      "id": 1,
+      "maximum_people": 4,
+      "radius": 64,
+      "type": "circle"
+    },
+    {
+      "id": 2,
+      "maximum_people": 3,
+      "type": "rectangle",
+      "x1": 384,
+      "x2": 582,
+      "y1": 77,
+      "y2": 156
+    },
+    {
+      "id": 3,
+      "type": "freehand",
+      "points": [
+        [
+          386,
+          232
+        ],
+        [
+          374,
+          324
+        ],
+        [
+          455,
+          359
+        ],
+        [
+          517,
+          299
+        ],
+        [
+          470,
+          224
+        ]
+      ],
+      "maximum_people": 3
+    }
+  ]
+}
