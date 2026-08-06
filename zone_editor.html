@@ -36,6 +36,34 @@
     padding: 20px;
   }
   #canvasWrap { position: relative; line-height: 0; }
+  #liveBadge {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: rgba(0,0,0,0.55);
+    color: #e7e9ee;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    padding: 4px 9px 4px 7px;
+    border-radius: 20px;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    pointer-events: none;
+  }
+  #liveBadge.shown { display: flex; }
+  #liveDot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #38c172;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  #liveDot.pulse {
+    transform: scale(1.4);
+    box-shadow: 0 0 6px 1px rgba(56,193,114,0.8);
+  }
   canvas {
     max-width: 100%;
     max-height: 88vh;
@@ -163,18 +191,20 @@
 <div id="canvasArea">
   <div id="canvasWrap">
     <canvas id="canvas" width="800" height="450"></canvas>
+    <div id="liveBadge"><span id="liveDot"></span>LIVE</div>
   </div>
   <div id="noSnapshot" style="display:none;">
-    No camera snapshot found yet.<br><br>
-    Run <code>detect_danger_zone.py</code> once (it saves <code>zone_reference.jpg</code>
-    automatically when the camera opens), then reload this page.
+    No camera feed yet.<br><br>
+    Run <code>detect_danger_zone.py</code> - it refreshes <code>zone_reference.jpg</code>
+    about once a second while it's running. This page will pick it up automatically,
+    no reload needed.
   </div>
 </div>
 
 <div id="sidebar">
   <div>
     <h1>Danger Zone Editor</h1>
-    <p class="sub">Create, move, resize, and delete zones. Changes only take effect after Save.</p>
+    <p class="sub">Background updates live from the camera (~1x/sec). Zone changes only take effect after Save.</p>
   </div>
 
   <div class="toolbar">
@@ -235,22 +265,76 @@ function toImageCoords(evt) {
 function handleRadius() { return HANDLE_PX * scaleFactor(); }
 
 // ---------- loading ----------
-async function loadSnapshot() {
+const SNAPSHOT_POLL_MS = 1000;   // matches detect_danger_zone.py's refresh rate
+let snapshotFound = false;
+let liveIndicatorTimer = null;
+
+function setLiveBadgeVisible(visible) {
+  document.getElementById('liveBadge').classList.toggle('shown', visible);
+}
+
+function loadSnapshot() {
+  // Used for the very first load - resolves once we know whether a
+  // snapshot exists at all, then startSnapshotPolling() takes over.
   return new Promise((resolve) => {
     img.onload = () => {
       canvas.width = img.naturalWidth;
       canvas.height = img.naturalHeight;
       document.getElementById('noSnapshot').style.display = 'none';
       canvas.style.display = 'block';
+      snapshotFound = true;
+      setLiveBadgeVisible(true);
+      redraw();
       resolve(true);
     };
     img.onerror = () => {
       canvas.style.display = 'none';
       document.getElementById('noSnapshot').style.display = 'block';
+      snapshotFound = false;
+      setLiveBadgeVisible(false);
       resolve(false);
     };
     img.src = '/zone_reference.jpg?ts=' + Date.now();
   });
+}
+
+function startSnapshotPolling() {
+  setInterval(() => {
+    const probe = new Image();
+    probe.onload = () => {
+      // Swap in the freshly loaded frame only after it's fully decoded, so
+      // there's never a flash of a half-loaded image. Canvas size is kept
+      // fixed to the original resolution (it shouldn't change frame to
+      // frame) so in-progress dragging/handles aren't disturbed.
+      img.src = probe.src;
+      if (!snapshotFound) {
+        canvas.width = probe.naturalWidth;
+        canvas.height = probe.naturalHeight;
+        document.getElementById('noSnapshot').style.display = 'none';
+        canvas.style.display = 'block';
+        snapshotFound = true;
+        setLiveBadgeVisible(true);
+      }
+      redraw();
+      flashLiveIndicator();
+    };
+    probe.onerror = () => {
+      if (!snapshotFound) {
+        canvas.style.display = 'none';
+        document.getElementById('noSnapshot').style.display = 'block';
+        setLiveBadgeVisible(false);
+      }
+    };
+    probe.src = '/zone_reference.jpg?ts=' + Date.now();
+  }, SNAPSHOT_POLL_MS);
+}
+
+function flashLiveIndicator() {
+  const dot = document.getElementById('liveDot');
+  if (!dot) return;
+  dot.classList.add('pulse');
+  clearTimeout(liveIndicatorTimer);
+  liveIndicatorTimer = setTimeout(() => dot.classList.remove('pulse'), 400);
 }
 
 async function loadZones() {
@@ -258,7 +342,13 @@ async function loadZones() {
     const res = await fetch('/api/zones');
     const data = await res.json();
     zones = data.zones || [];
-    nextZoneId = data.next_zone_id || (zones.reduce((m, z) => Math.max(m, z.id), 0) + 1);
+    // Don't just trust data.next_zone_id - if it's stale or <= an id
+    // already present (e.g. zones.json was hand-edited, or an older save
+    // left it behind), duplicate ids would break selection and incident
+    // tracking, which both key off id.
+    const maxId = zones.reduce((m, z) => Math.max(m, parseInt(z.id, 10) || 0), 0);
+    const safeNext = parseInt(data.next_zone_id, 10) || 1;
+    nextZoneId = Math.max(safeNext, maxId + 1);
   } catch (e) {
     zones = [];
     nextZoneId = 1;
@@ -648,6 +738,7 @@ document.getElementById('reloadBtn').onclick = loadZones;
 (async function init() {
   await loadSnapshot();
   await loadZones();
+  startSnapshotPolling();
 })();
 </script>
 </body>

@@ -9,9 +9,10 @@ provides three small endpoints:
     GET  /                -> serves zone_editor.html
     GET  /api/zones        -> returns the current contents of zones.json
     POST /api/zones        -> overwrites zones.json with the posted data
-    GET  /zone_reference.jpg -> serves the camera snapshot saved by
-                                 detect_danger_zone.py, used as the
-                                 background image to draw zones on
+    GET  /zone_reference.jpg -> serves the camera frame that
+                                 detect_danger_zone.py refreshes about once
+                                 a second, used as a near-live background
+                                 image to draw zones on
 
 Run this alongside (before or after) detect_danger_zone.py:
 
@@ -24,8 +25,13 @@ Both this server and detect_danger_zone.py read/write the SAME zones.json
 file in this folder, so:
   - Zones drawn in the OpenCV window and confirmed with ENTER are saved to
     zones.json and will show up here.
-  - Zones added/edited/deleted here and saved will be picked up the next
-    time detect_danger_zone.py starts (it loads zones.json at launch).
+  - Zones added/edited/deleted here and saved will be picked up automatically
+    by detect_danger_zone.py while it's running (checked every couple of
+    seconds), no restart needed.
+
+Note: the live background image only updates while detect_danger_zone.py is
+actually running - it owns the camera and writes zone_reference.jpg itself,
+since most webcams only allow one program to access them at a time.
 """
 
 import json
@@ -65,7 +71,11 @@ def index():
 def snapshot():
     if not os.path.exists(SNAPSHOT_FILE):
         return jsonify({"error": "No snapshot yet - run detect_danger_zone.py once first"}), 404
-    return send_from_directory(BASE_DIR, "zone_reference.jpg")
+    resp = send_from_directory(BASE_DIR, "zone_reference.jpg")
+    # This file is overwritten roughly once a second by detect_danger_zone.py
+    # for the near-live editor view - make sure the browser doesn't cache it.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/api/zones", methods=["GET"])
@@ -81,16 +91,49 @@ def save_zones():
         return jsonify({"error": "Expected JSON body with a 'zones' array"}), 400
 
     # Basic validation so a bad request from the browser can't corrupt
-    # zones.json for the detection script.
-    valid_types = {"rectangle", "circle", "freehand"}
+    # zones.json for the detection script - a missing shape field here
+    # would otherwise surface as a KeyError deep inside
+    # detect_danger_zone.py's drawing/detection loop instead of a clean
+    # error at save time.
+    required_fields = {
+        "rectangle": ("x1", "y1", "x2", "y2"),
+        "circle": ("cx", "cy", "radius"),
+        "freehand": ("points",),
+    }
+
     for zone in payload["zones"]:
-        if zone.get("type") not in valid_types:
-            return jsonify({"error": f"Invalid zone type: {zone.get('type')}"}), 400
+        zone_type = zone.get("type")
+        if zone_type not in required_fields:
+            return jsonify({"error": f"Invalid zone type: {zone_type}"}), 400
         if "id" not in zone or "maximum_people" not in zone:
             return jsonify({"error": "Each zone needs an 'id' and 'maximum_people'"}), 400
 
-    if "next_zone_id" not in payload:
-        payload["next_zone_id"] = (max((z["id"] for z in payload["zones"]), default=0) + 1)
+        try:
+            zone["id"] = int(zone["id"])
+            zone["maximum_people"] = int(zone["maximum_people"])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"Zone id/maximum_people must be integers (got id={zone.get('id')!r})"}), 400
+
+        missing = [f for f in required_fields[zone_type] if f not in zone]
+        if missing:
+            return jsonify({"error": f"Zone {zone.get('id')} ({zone_type}) is missing: {missing}"}), 400
+
+        if zone_type == "freehand" and len(zone["points"]) < 3:
+            return jsonify({"error": f"Zone {zone.get('id')} (freehand) needs at least 3 points"}), 400
+
+    # Always clamp next_zone_id to be at least one past the highest id
+    # actually present, instead of only filling it in when the field is
+    # missing entirely - a stale/too-small value here (e.g. after zones
+    # were deleted then new ones added client-side) could otherwise hand
+    # out a duplicate id later.
+    max_existing_id = max((z["id"] for z in payload["zones"]), default=0)
+
+    try:
+        requested_next_id = int(payload.get("next_zone_id", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'next_zone_id' must be an integer"}), 400
+
+    payload["next_zone_id"] = max(requested_next_id, max_existing_id + 1)
 
     write_zones(payload)
     return jsonify({"status": "ok", "saved": len(payload["zones"])})

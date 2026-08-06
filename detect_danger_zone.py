@@ -81,16 +81,11 @@ if not cap.isOpened():
 
 print("✓ Camera initialized")
 
-# Save one reference snapshot for the HTML zone editor to draw zones on top
-# of. Grabbed once here (not every frame) since it's just a visual guide -
-# zone coordinates are what matter, and those are saved separately.
+# The HTML zone editor displays this file as its background so you can draw
+# zones on top of it. It's refreshed periodically from inside the main loop
+# below (see refresh_editor_snapshot()) rather than captured once here, so
+# the editor shows a near-live view instead of a one-time-only photo.
 SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zone_reference.jpg")
-_ok, _snap_frame = cap.read()
-if _ok:
-    cv2.imwrite(SNAPSHOT_FILE, _snap_frame)
-    print(f"✓ Reference snapshot saved: {SNAPSHOT_FILE}")
-else:
-    print("⚠ Could not capture reference snapshot for the HTML editor")
 
 # -------------------- ALARM --------------------
 
@@ -209,6 +204,50 @@ def check_for_live_zone_updates():
     finalize_all_active_incidents()
     load_zones_from_file()
     print("↻ zones.json changed on disk - live-reloaded zones")
+
+
+# -------------------- LIVE EDITOR SNAPSHOT --------------------
+# Overwrites zone_reference.jpg with the current frame on a throttled
+# interval, so the HTML editor can poll it and show a near-live view
+# instead of a one-time-only photo. Written to a temp file first and then
+# swapped into place (os.replace is atomic on both Windows and Linux), so
+# zone_server.py never serves a half-written/corrupt JPEG mid-write.
+
+SNAPSHOT_REFRESH_SECONDS = 1.0
+_last_snapshot_time = 0.0
+_snapshot_warned = False
+
+
+def refresh_editor_snapshot(raw_frame):
+    """Call once per main-loop iteration with the raw (un-annotated) frame."""
+    global _last_snapshot_time, _snapshot_warned
+
+    now = time.time()
+    if now - _last_snapshot_time < SNAPSHOT_REFRESH_SECONDS:
+        return
+    _last_snapshot_time = now
+
+    try:
+        # Keep the .jpg extension on the temp file - cv2.imwrite picks its
+        # encoder from the filename's extension, so something like
+        # "zone_reference.jpg.tmp" (ending in .tmp) fails silently with no
+        # encoder found. "zone_reference_tmp.jpg" still ends in .jpg.
+        base, ext = os.path.splitext(SNAPSHOT_FILE)
+        tmp_path = f"{base}_tmp{ext}"
+
+        ok = cv2.imwrite(tmp_path, raw_frame)
+        if not ok:
+            raise RuntimeError("cv2.imwrite returned False")
+        os.replace(tmp_path, SNAPSHOT_FILE)
+        _snapshot_warned = False
+
+    except Exception as e:
+        # Non-critical - the editor just won't have an up-to-the-second
+        # frame this cycle. Don't let a snapshot hiccup crash detection,
+        # but do warn once so a persistent failure isn't silently invisible.
+        if not _snapshot_warned:
+            print(f"⚠ Could not update {SNAPSHOT_FILE} for the HTML editor: {e}")
+            _snapshot_warned = True
 
 # -------------------- DRAWING TOOL SELECTOR --------------------
 
@@ -409,7 +448,7 @@ def draw_zone(event, x, y, flags, param):
         elif event == cv2.EVENT_LBUTTONUP:
             if drawing:
                 drawing = False
-                if len(freehand_points) > 1:
+                if len(freehand_points) >= 3:
                     finish_zone_with_limit({"type": "freehand", "points": list(freehand_points)})
                 freehand_points = []
                 current_zone = None
@@ -504,7 +543,13 @@ def zone_bounding_box(zone):
     shape_type = zone.get("type")
 
     if shape_type == "rectangle":
-        return zone["x1"], zone["y1"], zone["x2"], zone["y2"]
+        # Normalize so zx1<zx2, zy1<zy2 regardless of which corner the zone
+        # was dragged from - person_in_zone_check's overlap test assumes
+        # this ordering, otherwise a bottom-right -> top-left drag silently
+        # breaks detection for that zone.
+        x1, x2 = sorted((zone["x1"], zone["x2"]))
+        y1, y2 = sorted((zone["y1"], zone["y2"]))
+        return x1, y1, x2, y2
 
     elif shape_type == "circle":
         cx, cy, r = zone["cx"], zone["cy"], zone["radius"]
@@ -792,6 +837,9 @@ try:
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Keep the HTML editor's background image close to live.
+        refresh_editor_snapshot(frame)
 
         # Pick up zone edits saved from zone_editor.html while this script
         # is already running (throttled internally - see
