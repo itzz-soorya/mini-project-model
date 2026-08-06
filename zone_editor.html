@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Danger Zone Editor</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1d2027;
+    --panel-alt: #262a33;
+    --border: #333844;
+    --text: #e7e9ee;
+    --text-dim: #9aa0ab;
+    --accent: #4f8cff;
+    --danger: #ff5c5c;
+    --ok: #38c172;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #canvasArea {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0b0c0f;
+    position: relative;
+    overflow: auto;
+    padding: 20px;
+  }
+  #canvasWrap { position: relative; line-height: 0; }
+  canvas {
+    max-width: 100%;
+    max-height: 88vh;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: crosshair;
+    background: #000;
+  }
+  #noSnapshot {
+    color: var(--text-dim);
+    text-align: center;
+    max-width: 420px;
+    line-height: 1.5;
+  }
+  #sidebar {
+    width: 340px;
+    min-width: 340px;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 18px;
+    gap: 14px;
+    overflow-y: auto;
+  }
+  h1 { font-size: 17px; margin: 0 0 2px 0; }
+  .sub { color: var(--text-dim); font-size: 12.5px; margin: 0 0 4px 0; }
+  .toolbar {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  button {
+    font-family: inherit;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    color: var(--text);
+    padding: 9px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  button:hover { background: #2f3542; }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; grid-column: 1 / -1; }
+  button.primary:hover { background: #3d7ae0; }
+  button.warn { color: var(--danger); }
+  button.small { padding: 5px 8px; font-size: 12px; }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  #freehandHint {
+    display: none;
+    font-size: 12.5px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: var(--text-dim);
+  }
+
+  #zoneList { display: flex; flex-direction: column; gap: 8px; }
+  .zoneCard {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    cursor: pointer;
+  }
+  .zoneCard.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .zoneCard .row1 {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .zoneCard .badge {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+    background: #14161a;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+  }
+  .zoneCard .maxRow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+  .zoneCard input[type="number"] {
+    width: 56px;
+    background: #14161a;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-size: 12.5px;
+  }
+  .zoneCard .actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 6px;
+  }
+  #emptyState { color: var(--text-dim); font-size: 12.5px; text-align: center; padding: 20px 0; }
+
+  #status {
+    font-size: 12.5px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    display: none;
+  }
+  #status.ok { display: block; background: rgba(56,193,114,0.12); color: var(--ok); border: 1px solid rgba(56,193,114,0.35); }
+  #status.err { display: block; background: rgba(255,92,92,0.12); color: var(--danger); border: 1px solid rgba(255,92,92,0.35); }
+
+  .footerBtns { display: flex; gap: 8px; margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border); }
+  .footerBtns button { flex: 1; }
+</style>
+</head>
+<body>
+
+<div id="canvasArea">
+  <div id="canvasWrap">
+    <canvas id="canvas" width="800" height="450"></canvas>
+  </div>
+  <div id="noSnapshot" style="display:none;">
+    No camera snapshot found yet.<br><br>
+    Run <code>detect_danger_zone.py</code> once (it saves <code>zone_reference.jpg</code>
+    automatically when the camera opens), then reload this page.
+  </div>
+</div>
+
+<div id="sidebar">
+  <div>
+    <h1>Danger Zone Editor</h1>
+    <p class="sub">Create, move, resize, and delete zones. Changes only take effect after Save.</p>
+  </div>
+
+  <div class="toolbar">
+    <button id="toolSelect" class="active">Select / Move</button>
+    <button id="toolRect">+ Rectangle</button>
+    <button id="toolCircle">+ Circle</button>
+    <button id="toolFreehand">+ Freehand</button>
+  </div>
+
+  <div id="freehandHint">
+    Click to add points. Double-click (or the "Finish shape" button) to close the outline.
+    <div style="margin-top:8px;">
+      <button id="finishFreehand" class="small">Finish shape</button>
+      <button id="cancelFreehand" class="small warn">Cancel</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <div>
+    <div class="sub" style="margin-bottom:6px;">Zones (<span id="zoneCount">0</span>)</div>
+    <div id="zoneList"></div>
+    <div id="emptyState">No zones yet. Pick a tool above and draw on the image.</div>
+  </div>
+
+  <div class="footerBtns">
+    <button id="reloadBtn">Reload</button>
+    <button id="saveBtn" class="primary">Save All</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const img = new Image();
+
+let zones = [];
+let nextZoneId = 1;
+let selectedZoneId = null;
+let mode = 'select';          // 'select' | 'rectangle' | 'circle' | 'freehand'
+let freehandDraft = [];
+let drag = null;              // active drag/resize/create operation
+const HANDLE_PX = 8;          // handle hit radius in *displayed* pixels
+
+// ---------- coordinate helpers ----------
+function scaleFactor() {
+  const rect = canvas.getBoundingClientRect();
+  return canvas.width / rect.width;
+}
+function toImageCoords(evt) {
+  const rect = canvas.getBoundingClientRect();
+  const s = canvas.width / rect.width;
+  return {
+    x: Math.round((evt.clientX - rect.left) * s),
+    y: Math.round((evt.clientY - rect.top) * s)
+  };
+}
+function handleRadius() { return HANDLE_PX * scaleFactor(); }
+
+// ---------- loading ----------
+async function loadSnapshot() {
+  return new Promise((resolve) => {
+    img.onload = () => {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      document.getElementById('noSnapshot').style.display = 'none';
+      canvas.style.display = 'block';
+      resolve(true);
+    };
+    img.onerror = () => {
+      canvas.style.display = 'none';
+      document.getElementById('noSnapshot').style.display = 'block';
+      resolve(false);
+    };
+    img.src = '/zone_reference.jpg?ts=' + Date.now();
+  });
+}
+
+async function loadZones() {
+  try {
+    const res = await fetch('/api/zones');
+    const data = await res.json();
+    zones = data.zones || [];
+    nextZoneId = data.next_zone_id || (zones.reduce((m, z) => Math.max(m, z.id), 0) + 1);
+  } catch (e) {
+    zones = [];
+    nextZoneId = 1;
+    showStatus('Could not reach zone_server.py - is it running?', true);
+  }
+  selectedZoneId = null;
+  renderList();
+  redraw();
+}
+
+// ---------- rendering ----------
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (img.complete && img.naturalWidth) {
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  }
+  zones.forEach(z => drawZone(z, z.id === selectedZoneId));
+  if (mode === 'freehand' && freehandDraft.length) {
+    drawFreehandDraft();
+  }
+}
+
+function drawZone(zone, selected) {
+  const color = selected ? '#4f8cff' : '#ff5c5c';
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = selected ? 3 : 2;
+
+  if (zone.type === 'rectangle') {
+    ctx.strokeRect(zone.x1, zone.y1, zone.x2 - zone.x1, zone.y2 - zone.y1);
+    if (selected) rectHandles(zone).forEach(h => drawHandle(h.x, h.y));
+  } else if (zone.type === 'circle') {
+    ctx.beginPath();
+    ctx.arc(zone.cx, zone.cy, zone.radius, 0, Math.PI * 2);
+    ctx.stroke();
+    if (selected) {
+      drawHandle(zone.cx, zone.cy);
+      drawHandle(zone.cx + zone.radius, zone.cy);
+    }
+  } else if (zone.type === 'freehand') {
+    const pts = zone.points;
+    if (pts.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      pts.slice(1).forEach(p => ctx.lineTo(p[0], p[1]));
+      ctx.closePath();
+      ctx.stroke();
+    }
+    if (selected) pts.forEach(p => drawHandle(p[0], p[1]));
+  }
+
+  // label
+  const bb = zoneBBox(zone);
+  ctx.font = `${14 * scaleFactor()}px sans-serif`;
+  ctx.fillText(`Zone ${zone.id} (max ${zone.maximum_people})`, bb.x1, Math.max(bb.y1 - 6, 12));
+}
+
+function drawHandle(x, y) {
+  const r = handleRadius() * 0.6;
+  ctx.save();
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#4f8cff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawFreehandDraft() {
+  ctx.strokeStyle = '#38c172';
+  ctx.fillStyle = '#38c172';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(freehandDraft[0][0], freehandDraft[0][1]);
+  freehandDraft.slice(1).forEach(p => ctx.lineTo(p[0], p[1]));
+  ctx.stroke();
+  freehandDraft.forEach(p => drawHandle(p[0], p[1]));
+}
+
+function rectHandles(z) {
+  return [
+    { x: z.x1, y: z.y1, corner: 'tl' },
+    { x: z.x2, y: z.y1, corner: 'tr' },
+    { x: z.x2, y: z.y2, corner: 'br' },
+    { x: z.x1, y: z.y2, corner: 'bl' }
+  ];
+}
+
+function zoneBBox(zone) {
+  if (zone.type === 'rectangle') {
+    return { x1: Math.min(zone.x1, zone.x2), y1: Math.min(zone.y1, zone.y2) };
+  } else if (zone.type === 'circle') {
+    return { x1: zone.cx - zone.radius, y1: zone.cy - zone.radius };
+  } else {
+    const xs = zone.points.map(p => p[0]), ys = zone.points.map(p => p[1]);
+    return { x1: Math.min(...xs), y1: Math.min(...ys) };
+  }
+}
+
+// ---------- hit testing ----------
+function dist(x1, y1, x2, y2) { return Math.hypot(x1 - x2, y1 - y2); }
+
+function findHandleHit(x, y) {
+  if (selectedZoneId === null) return null;
+  const zone = zones.find(z => z.id === selectedZoneId);
+  if (!zone) return null;
+  const hr = handleRadius();
+
+  if (zone.type === 'rectangle') {
+    for (const h of rectHandles(zone)) {
+      if (dist(x, y, h.x, h.y) <= hr) return { kind: 'rect-corner', corner: h.corner };
+    }
+  } else if (zone.type === 'circle') {
+    if (dist(x, y, zone.cx, zone.cy) <= hr) return { kind: 'circle-center' };
+    if (dist(x, y, zone.cx + zone.radius, zone.cy) <= hr) return { kind: 'circle-radius' };
+  } else if (zone.type === 'freehand') {
+    for (let i = 0; i < zone.points.length; i++) {
+      const [px, py] = zone.points[i];
+      if (dist(x, y, px, py) <= hr) return { kind: 'freehand-vertex', index: i };
+    }
+  }
+  return null;
+}
+
+function pointInZone(x, y, zone) {
+  if (zone.type === 'rectangle') {
+    const x1 = Math.min(zone.x1, zone.x2), x2 = Math.max(zone.x1, zone.x2);
+    const y1 = Math.min(zone.y1, zone.y2), y2 = Math.max(zone.y1, zone.y2);
+    return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+  } else if (zone.type === 'circle') {
+    return dist(x, y, zone.cx, zone.cy) <= zone.radius;
+  } else if (zone.type === 'freehand') {
+    // ray casting
+    const pts = zone.points;
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const [xi, yi] = pts[i], [xj, yj] = pts[j];
+      const intersect = ((yi > y) !== (yj > y)) &&
+        (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+  return false;
+}
+
+function findZoneAt(x, y) {
+  // topmost (last drawn) first
+  for (let i = zones.length - 1; i >= 0; i--) {
+    if (pointInZone(x, y, zones[i])) return zones[i];
+  }
+  return null;
+}
+
+// ---------- mouse interaction ----------
+canvas.addEventListener('mousedown', (evt) => {
+  const { x, y } = toImageCoords(evt);
+
+  if (mode === 'rectangle') {
+    drag = { kind: 'create-rect', x0: x, y0: y };
+    const z = { id: nextZoneId, type: 'rectangle', x1: x, y1: y, x2: x, y2: y, maximum_people: 1 };
+    zones.push(z);
+    selectedZoneId = z.id;
+    return;
+  }
+  if (mode === 'circle') {
+    drag = { kind: 'create-circle', cx: x, cy: y };
+    const z = { id: nextZoneId, type: 'circle', cx: x, cy: y, radius: 1, maximum_people: 1 };
+    zones.push(z);
+    selectedZoneId = z.id;
+    return;
+  }
+  if (mode === 'freehand') {
+    freehandDraft.push([x, y]);
+    redraw();
+    return;
+  }
+
+  // select mode
+  const handleHit = findHandleHit(x, y);
+  if (handleHit) {
+    drag = { kind: 'resize', handle: handleHit, zoneId: selectedZoneId };
+    return;
+  }
+  const hit = findZoneAt(x, y);
+  if (hit) {
+    selectedZoneId = hit.id;
+    drag = { kind: 'move', zoneId: hit.id, lastX: x, lastY: y };
+    renderList();
+  } else {
+    selectedZoneId = null;
+    renderList();
+  }
+  redraw();
+});
+
+canvas.addEventListener('mousemove', (evt) => {
+  if (!drag) return;
+  const { x, y } = toImageCoords(evt);
+  const zone = zones.find(z => z.id === (drag.zoneId || nextZoneId));
+
+  if (drag.kind === 'create-rect') {
+    const z = zones[zones.length - 1];
+    z.x2 = x; z.y2 = y;
+  } else if (drag.kind === 'create-circle') {
+    const z = zones[zones.length - 1];
+    z.radius = Math.max(1, Math.round(dist(drag.cx, drag.cy, x, y)));
+  } else if (drag.kind === 'move') {
+    const z = zones.find(zz => zz.id === drag.zoneId);
+    const dx = x - drag.lastX, dy = y - drag.lastY;
+    if (z.type === 'rectangle') { z.x1 += dx; z.y1 += dy; z.x2 += dx; z.y2 += dy; }
+    else if (z.type === 'circle') { z.cx += dx; z.cy += dy; }
+    else if (z.type === 'freehand') { z.points = z.points.map(p => [p[0] + dx, p[1] + dy]); }
+    drag.lastX = x; drag.lastY = y;
+  } else if (drag.kind === 'resize') {
+    const z = zones.find(zz => zz.id === drag.zoneId);
+    const h = drag.handle;
+    if (h.kind === 'rect-corner') {
+      if (h.corner === 'tl') { z.x1 = x; z.y1 = y; }
+      if (h.corner === 'tr') { z.x2 = x; z.y1 = y; }
+      if (h.corner === 'br') { z.x2 = x; z.y2 = y; }
+      if (h.corner === 'bl') { z.x1 = x; z.y2 = y; }
+    } else if (h.kind === 'circle-center') {
+      z.cx = x; z.cy = y;
+    } else if (h.kind === 'circle-radius') {
+      z.radius = Math.max(1, Math.round(dist(z.cx, z.cy, x, y)));
+    } else if (h.kind === 'freehand-vertex') {
+      z.points[h.index] = [x, y];
+    }
+  }
+  redraw();
+});
+
+canvas.addEventListener('mouseup', () => {
+  if (drag && (drag.kind === 'create-rect' || drag.kind === 'create-circle')) {
+    finishShapeCreation();
+  }
+  drag = null;
+});
+
+canvas.addEventListener('dblclick', () => {
+  if (mode === 'freehand' && freehandDraft.length >= 3) finishFreehand();
+});
+
+function finishShapeCreation() {
+  mode = 'select';
+  setActiveToolButton();
+  const z = zones[zones.length - 1];
+  if (z.type === 'rectangle') {
+    // normalize so x1<x2, y1<y2 (the detector assumes this ordering)
+    const x1 = Math.min(z.x1, z.x2), x2 = Math.max(z.x1, z.x2);
+    const y1 = Math.min(z.y1, z.y2), y2 = Math.max(z.y1, z.y2);
+    z.x1 = x1; z.y1 = y1; z.x2 = x2; z.y2 = y2;
+    if (x2 - x1 < 4 || y2 - y1 < 4) { zones.pop(); selectedZoneId = null; redraw(); renderList(); return; }
+  }
+  if (z.type === 'circle' && z.radius < 4) { zones.pop(); selectedZoneId = null; redraw(); renderList(); return; }
+  nextZoneId += 1;
+  renderList();
+  redraw();
+}
+
+function finishFreehand() {
+  if (freehandDraft.length < 3) return;
+  const z = { id: nextZoneId, type: 'freehand', points: freehandDraft, maximum_people: 1 };
+  zones.push(z);
+  nextZoneId += 1;
+  selectedZoneId = z.id;
+  freehandDraft = [];
+  mode = 'select';
+  setActiveToolButton();
+  document.getElementById('freehandHint').style.display = 'none';
+  renderList();
+  redraw();
+}
+
+function cancelFreehand() {
+  freehandDraft = [];
+  mode = 'select';
+  setActiveToolButton();
+  document.getElementById('freehandHint').style.display = 'none';
+  redraw();
+}
+
+// ---------- toolbar ----------
+function setActiveToolButton() {
+  ['toolSelect', 'toolRect', 'toolCircle', 'toolFreehand'].forEach(id => {
+    document.getElementById(id).classList.remove('active');
+  });
+  const map = { select: 'toolSelect', rectangle: 'toolRect', circle: 'toolCircle', freehand: 'toolFreehand' };
+  document.getElementById(map[mode]).classList.add('active');
+  document.getElementById('freehandHint').style.display = (mode === 'freehand') ? 'block' : 'none';
+}
+document.getElementById('toolSelect').onclick = () => { mode = 'select'; freehandDraft = []; setActiveToolButton(); redraw(); };
+document.getElementById('toolRect').onclick = () => { mode = 'rectangle'; freehandDraft = []; setActiveToolButton(); redraw(); };
+document.getElementById('toolCircle').onclick = () => { mode = 'circle'; freehandDraft = []; setActiveToolButton(); redraw(); };
+document.getElementById('toolFreehand').onclick = () => { mode = 'freehand'; freehandDraft = []; setActiveToolButton(); redraw(); };
+document.getElementById('finishFreehand').onclick = finishFreehand;
+document.getElementById('cancelFreehand').onclick = cancelFreehand;
+
+// ---------- sidebar list (CRUD: read/update/delete) ----------
+function renderList() {
+  const list = document.getElementById('zoneList');
+  const empty = document.getElementById('emptyState');
+  document.getElementById('zoneCount').textContent = zones.length;
+  list.innerHTML = '';
+  empty.style.display = zones.length ? 'none' : 'block';
+
+  zones.forEach(z => {
+    const card = document.createElement('div');
+    card.className = 'zoneCard' + (z.id === selectedZoneId ? ' selected' : '');
+    card.innerHTML = `
+      <div class="row1">
+        <strong>Zone ${z.id}</strong>
+        <span class="badge">${z.type}</span>
+      </div>
+      <div class="maxRow">
+        Max people:
+        <input type="number" min="0" value="${z.maximum_people}" data-id="${z.id}" class="maxInput">
+      </div>
+      <div class="actions">
+        <button class="small selectBtn" data-id="${z.id}">Select</button>
+        <button class="small warn deleteBtn" data-id="${z.id}">Delete</button>
+      </div>
+    `;
+    card.onclick = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+      selectedZoneId = z.id;
+      renderList();
+      redraw();
+    };
+    list.appendChild(card);
+  });
+
+  list.querySelectorAll('.maxInput').forEach(inp => {
+    inp.addEventListener('change', (e) => {
+      const id = parseInt(e.target.dataset.id, 10);
+      const z = zones.find(zz => zz.id === id);
+      z.maximum_people = Math.max(0, parseInt(e.target.value, 10) || 0);
+      redraw();
+    });
+  });
+  list.querySelectorAll('.selectBtn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      selectedZoneId = parseInt(e.target.dataset.id, 10);
+      renderList();
+      redraw();
+    });
+  });
+  list.querySelectorAll('.deleteBtn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const id = parseInt(e.target.dataset.id, 10);
+      zones = zones.filter(z => z.id !== id);
+      if (selectedZoneId === id) selectedZoneId = null;
+      renderList();
+      redraw();
+    });
+  });
+}
+
+// ---------- save / reload ----------
+function showStatus(msg, isError) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = isError ? 'err' : 'ok';
+  setTimeout(() => { el.className = ''; }, 3500);
+}
+
+document.getElementById('saveBtn').onclick = async () => {
+  try {
+    const res = await fetch('/api/zones', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ next_zone_id: nextZoneId, zones })
+    });
+    const data = await res.json();
+    if (res.ok) showStatus(`Saved ${data.saved} zone(s) to zones.json`, false);
+    else showStatus(data.error || 'Save failed', true);
+  } catch (e) {
+    showStatus('Could not reach zone_server.py', true);
+  }
+};
+document.getElementById('reloadBtn').onclick = loadZones;
+
+// ---------- init ----------
+(async function init() {
+  await loadSnapshot();
+  await loadZones();
+})();
+</script>
+</body>
+</html>

@@ -6,6 +6,9 @@ numpy>=1.24.0
 # Dataset Download
 kagglehub>=0.2.0
 
+# Arduino Serial Communication
+pyserial>=3.5
+
 # Age Detection (Optional - only needed if ENABLE_AGE_DETECTION=True)
 deepface>=0.0.79
 tf-keras>=2.15.0

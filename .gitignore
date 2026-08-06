@@ -1,0 +1,14 @@
+coco2017/
+
+# Model files (too large for git)
+*.pt
+*.pth
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
