@@ -2,8 +2,8 @@
   "next_zone_id": 4,
   "zones": [
     {
-      "cx": 184,
-      "cy": 315,
+      "cx": 166,
+      "cy": 80,
       "id": 1,
       "maximum_people": 4,
       "radius": 64,
@@ -20,7 +20,7 @@
     },
     {
       "id": 3,
-      "type": "freehand",
+      "maximum_people": 3,
       "points": [
         [
           386,
@@ -43,7 +43,7 @@
           224
         ]
       ],
-      "maximum_people": 3
+      "type": "freehand"
     }
   ]
 }
