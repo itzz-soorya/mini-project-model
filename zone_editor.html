@@ -47,11 +47,12 @@
     letter-spacing: 0.06em;
     padding: 4px 9px 4px 7px;
     border-radius: 20px;
-    display: flex;
+    display: none;
     align-items: center;
     gap: 6px;
     pointer-events: none;
   }
+  #liveBadge.shown { display: flex; }
   #liveDot {
     width: 7px;
     height: 7px;
@@ -268,6 +269,10 @@ const SNAPSHOT_POLL_MS = 1000;   // matches detect_danger_zone.py's refresh rate
 let snapshotFound = false;
 let liveIndicatorTimer = null;
 
+function setLiveBadgeVisible(visible) {
+  document.getElementById('liveBadge').classList.toggle('shown', visible);
+}
+
 function loadSnapshot() {
   // Used for the very first load - resolves once we know whether a
   // snapshot exists at all, then startSnapshotPolling() takes over.
@@ -278,6 +283,7 @@ function loadSnapshot() {
       document.getElementById('noSnapshot').style.display = 'none';
       canvas.style.display = 'block';
       snapshotFound = true;
+      setLiveBadgeVisible(true);
       redraw();
       resolve(true);
     };
@@ -285,6 +291,7 @@ function loadSnapshot() {
       canvas.style.display = 'none';
       document.getElementById('noSnapshot').style.display = 'block';
       snapshotFound = false;
+      setLiveBadgeVisible(false);
       resolve(false);
     };
     img.src = '/zone_reference.jpg?ts=' + Date.now();
@@ -306,6 +313,7 @@ function startSnapshotPolling() {
         document.getElementById('noSnapshot').style.display = 'none';
         canvas.style.display = 'block';
         snapshotFound = true;
+        setLiveBadgeVisible(true);
       }
       redraw();
       flashLiveIndicator();
@@ -314,6 +322,7 @@ function startSnapshotPolling() {
       if (!snapshotFound) {
         canvas.style.display = 'none';
         document.getElementById('noSnapshot').style.display = 'block';
+        setLiveBadgeVisible(false);
       }
     };
     probe.src = '/zone_reference.jpg?ts=' + Date.now();
@@ -337,8 +346,9 @@ async function loadZones() {
     // already present (e.g. zones.json was hand-edited, or an older save
     // left it behind), duplicate ids would break selection and incident
     // tracking, which both key off id.
-    const maxId = zones.reduce((m, z) => Math.max(m, z.id), 0);
-    nextZoneId = Math.max(data.next_zone_id || 1, maxId + 1);
+    const maxId = zones.reduce((m, z) => Math.max(m, parseInt(z.id, 10) || 0), 0);
+    const safeNext = parseInt(data.next_zone_id, 10) || 1;
+    nextZoneId = Math.max(safeNext, maxId + 1);
   } catch (e) {
     zones = [];
     nextZoneId = 1;

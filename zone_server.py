@@ -108,6 +108,12 @@ def save_zones():
         if "id" not in zone or "maximum_people" not in zone:
             return jsonify({"error": "Each zone needs an 'id' and 'maximum_people'"}), 400
 
+        try:
+            zone["id"] = int(zone["id"])
+            zone["maximum_people"] = int(zone["maximum_people"])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"Zone id/maximum_people must be integers (got id={zone.get('id')!r})"}), 400
+
         missing = [f for f in required_fields[zone_type] if f not in zone]
         if missing:
             return jsonify({"error": f"Zone {zone.get('id')} ({zone_type}) is missing: {missing}"}), 400
@@ -121,7 +127,13 @@ def save_zones():
     # were deleted then new ones added client-side) could otherwise hand
     # out a duplicate id later.
     max_existing_id = max((z["id"] for z in payload["zones"]), default=0)
-    payload["next_zone_id"] = max(payload.get("next_zone_id", 1), max_existing_id + 1)
+
+    try:
+        requested_next_id = int(payload.get("next_zone_id", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'next_zone_id' must be an integer"}), 400
+
+    payload["next_zone_id"] = max(requested_next_id, max_existing_id + 1)
 
     write_zones(payload)
     return jsonify({"status": "ok", "saved": len(payload["zones"])})
