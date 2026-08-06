@@ -1,85 +1,121 @@
-# 🚨 Danger Zone Detection System
+# Danger Zone Detection System
 
-An intelligent real-time person detection system that monitors danger zones and triggers alarms when someone enters restricted areas. Built with custom-trained YOLOv8 and OpenCV.
+A real-time person detection system that monitors user-defined danger zones and triggers an alarm when someone enters a restricted area. Built with a custom-trained YOLOv8 model and OpenCV, with an optional browser-based tool for creating and editing zones.
 
-## 🎯 Features
+## Overview
 
-- **Real-time Person Detection** using custom-trained YOLOv8
-- **Custom Danger Zones** - Draw zones with mouse
-- **Automatic Alarm** - Triggers when person enters danger zone
-- **Age Detection** (Optional) - Filter for children only
-- **Face Validation** - Reduces false positives
-- **Fullscreen Monitoring** - Professional surveillance interface
+The system watches a live camera feed, checks whether detected people fall inside one or more marked "danger zones," and raises an alarm (buzzer or system beep) when a zone's configured person limit is exceeded. Each incident is logged with a timestamp, a snapshot image, and a short video clip for later review.
 
-## 📋 Requirements
+Zones can be created directly in the application's video window, or edited afterward through a companion web page that reads and writes the same configuration file, so zones do not need to be redrawn from scratch every time they change.
 
-- Python 3.8+
+## Features
+
+- Real-time person detection using a custom-trained YOLOv8 model
+- Custom danger zones - rectangle, circle, and freehand shapes
+- Automatic alarm when a zone's person limit is exceeded, with Arduino buzzer or system beep support
+- Optional age detection to filter for children only
+- Face validation to reduce false positives
+- Fullscreen monitoring interface
+- Incident logging - CSV records plus saved photo/video evidence for each violation
+- Browser-based zone editor with full create/read/update/delete support, live camera preview, and automatic reload of changes into the running detector
+
+## Requirements
+
+- Python 3.8 or later
 - Webcam
-- Windows OS (for alarm sounds)
-- GPU recommended (for training)
-- 100GB+ disk space (for COCO dataset)
+- Windows OS (required for the built-in alarm sound; Arduino buzzer support works cross-platform)
+- GPU recommended for training
+- 100 GB or more of free disk space (for the COCO dataset, only needed if training your own model)
+- Flask (only needed if using the browser-based zone editor)
 
-## 🚀 Setup Instructions
+## Setup Instructions
 
-### 1. Install Dependencies
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Download COCO 2017 Dataset
+### 2. Download the COCO 2017 dataset
 
 ```bash
 python download_dataset.py
 ```
 
-This will download the COCO 2017 dataset (~25GB) required for training.
+This downloads the COCO 2017 dataset (approximately 25 GB), required only if you intend to train your own model. See the Kaggle API Setup section below for the credentials this step requires.
 
-**Note:** You'll need to set up Kaggle API credentials first (see Kaggle API Setup section below).
-
-### 3. Train Custom YOLO Model
+### 3. Train a custom YOLO model
 
 ```bash
 python train_model.py
 ```
 
-This trains a custom YOLOv8 model on the COCO dataset. Training takes 3-8 hours depending on hardware.
+This trains a custom YOLOv8 model on the COCO dataset. Training takes 3 to 8 hours depending on hardware.
 
-### 4. Run Detection System
+### 4. Run the detection system
 
 ```bash
 python detect_danger_zone.py
 ```
 
-## 🎮 How to Use
+## Basic Usage
 
-1. **Launch the application**
+1. Launch the application:
    ```bash
    python detect_danger_zone.py
    ```
 
-2. **Draw Danger Zones**
-   - Click and drag on the video to draw rectangular zones
-   - Draw as many zones as needed
-   - Zones appear in red
+2. Draw danger zones directly on the video window using the on-screen toolbar (rectangle, circle, or freehand tool). Zones are outlined in red and each one has a configurable maximum person count.
 
-3. **Start Detection**
-   - Press `ENTER` to confirm zones and start monitoring
-   - System will detect persons entering danger zones
+3. Press `ENTER` to confirm the zones and start monitoring. The detector will begin tracking people and comparing zone occupancy against each zone's limit.
 
-4. **Alarm System**
-   - Alarm sounds when person enters danger zone
-   - Alarm stops when zone is clear
-   - "ALERT!" message displays on screen
+4. When a zone's limit is exceeded, the alarm sounds and an "ALERT" message is shown on screen. The alarm stops automatically once the zone is clear.
 
-5. **Controls**
-   - `ENTER` - Start detection
-   - `R` - Reset zones (draw new ones)
-   - `ESC` - Exit application
+### Controls
 
-## ⚙️ Configuration
+| Key | Action |
+|-----|--------|
+| `ENTER` | Confirm zones and start detection |
+| `R` | Reset all zones and return to drawing mode |
+| `ESC` | Exit the application |
 
-Edit settings in `detect_danger_zone.py`:
+## Zone Editor (Browser-Based)
+
+Drawing and adjusting zones by hand in the OpenCV window is fine for a first pass, but tedious for ongoing changes. The project includes a small local web application for managing zones instead.
+
+### How it works
+
+`detect_danger_zone.py` saves its zone configuration to `zones.json` and continuously refreshes a reference image (`zone_reference.jpg`) from the live camera feed while it runs. A separate local server, `zone_server.py`, serves a browser page (`zone_editor.html`) that reads and writes the same `zones.json` file, using the reference image as a near-live background to draw on.
+
+### Running the editor
+
+```bash
+pip install flask
+python zone_server.py
+```
+
+Then open `http://localhost:5000` in a browser.
+
+### What you can do in the editor
+
+- View all current zones overlaid on a near-live camera image, refreshed roughly once per second
+- Create new rectangle, circle, or freehand zones
+- Move and resize existing zones by dragging their body or handles
+- Edit each zone's maximum person count
+- Delete zones
+- Save changes back to `zones.json`
+
+### Live updates
+
+Changes saved in the browser are picked up automatically by `detect_danger_zone.py` while it is running - there is no need to restart it. The detector checks for changes to `zones.json` every few seconds and reloads the zone list when it detects a change, finalizing any in-progress incident recordings first so nothing is left in an inconsistent state.
+
+The reference image requires `detect_danger_zone.py` to be running, since it owns the camera and is the only process writing that file. If `detect_danger_zone.py` has never been run, the editor will show a message indicating that no camera feed is available yet, and will pick it up automatically once the detector starts.
+
+Note that `zone_server.py` and `detect_danger_zone.py` are independent programs. You only need to run `zone_server.py` while actively editing zones in the browser; it can be stopped afterward without affecting the detector.
+
+## Configuration
+
+Key settings can be edited near the top of `detect_danger_zone.py`:
 
 ```python
 # Enable age detection (requires deepface)
@@ -89,32 +125,63 @@ ENABLE_AGE_DETECTION = False  # Set to True for child-only detection
 AGE_THRESHOLD = 14  # Years
 
 # Detection confidence
-if conf < 0.6:  # Adjust confidence threshold (0.0 - 1.0)
+if conf < 0.6:  # Adjust confidence threshold (0.0 to 1.0)
     continue
+
+# Arduino buzzer
+ENABLE_ARDUINO_BUZZER = True
+ARDUINO_PORT = "COM5"  # Adjust to match your system
 ```
 
-## 📁 Project Structure
+Use `find_arduino_port.py` to identify which serial port your Arduino is connected to, and `test_arduino_connection.py` to confirm the connection works before running the full detection script. See `ARDUINO_SETUP.md`, `BUZZER_CONNECTION_GUIDE.md`, and `UPLOAD_GUIDE.md` for the full hardware setup.
+
+## Project Structure
 
 ```
 mini-project-model/
-├── detect_danger_zone.py      # Main application
-├── train_model.py             # Model training script
-├── download_dataset.py        # Dataset downloader
-├── setup.py                   # Automated setup
-├── requirements.txt           # Dependencies
-├── README.md                  # This file
-├── danger_zone_model.pt       # Trained YOLO model (created after setup)
-├── alarm.wav                  # Alarm sound (optional)
-└── runs/                      # Training outputs (if custom training)
+├── coco2017/                       Downloaded COCO dataset (created by download_dataset.py)
+├── detect_danger_zone.py           Main detection application
+├── zone_server.py                  Local server for the browser-based zone editor
+├── zone_editor.html                Browser zone editor (served by zone_server.py)
+├── zones.json                      Saved zone configuration (created automatically)
+├── zone_reference.jpg              Live reference image for the editor (created automatically)
+├── train_model.py                  Model training script
+├── download_dataset.py             Dataset downloader
+├── danger_zone_model.pt            Custom-trained YOLO model (created after training)
+├── yolov8n.pt                      Base YOLOv8 nano checkpoint used as the training starting point
+├── arduino_buzzer_control.ino      Arduino sketch - listens on serial for buzzer on/off commands
+├── find_arduino_port.py            Utility - lists available serial ports to help identify the Arduino
+├── test_arduino_connection.py      Utility - verifies the serial connection to the Arduino before running detection
+├── alarm.wav                       Custom alarm sound (optional)
+├── requirements.txt                Python dependencies
+├── .gitignore
+├── README.md                       This file
+├── ARDUINO_SETUP.md                Arduino IDE and board setup guide
+├── BUZZER_CONNECTION_GUIDE.md      Buzzer wiring guide
+├── QUICK_BUZZER_CONNECT.md         Condensed quick-reference version of the buzzer wiring guide
+└── UPLOAD_GUIDE.md                 Guide for uploading arduino_buzzer_control.ino to the board
 ```
 
-## 🔧 Advanced Options
+`runs/` is also created under the project root once `train_model.py` has been run, containing training outputs.
 
-### Custom Alarm Sound
+## Additional Documentation
 
-Place a `.wav` file named `alarm.wav` in the project directory. The system will use it automatically.
+The Arduino-related setup is split across a few focused guides rather than one long document:
 
-### Age Detection Setup
+- `ARDUINO_SETUP.md` - installing the Arduino IDE, selecting the board and processor, and general first-time setup
+- `BUZZER_CONNECTION_GUIDE.md` - wiring the buzzer to the Arduino
+- `QUICK_BUZZER_CONNECT.md` - a condensed version of the wiring guide for quick reference
+- `UPLOAD_GUIDE.md` - uploading `arduino_buzzer_control.ino` to the board
+
+If any of these have drifted from what's actually in the files, treat this list as a starting point and adjust the descriptions to match.
+
+## Advanced Options
+
+### Custom alarm sound
+
+Place a `.wav` file named `alarm.wav` in the project directory. The system uses it automatically if present, and falls back to a system beep otherwise.
+
+### Age detection setup
 
 To enable age-based filtering:
 
@@ -123,131 +190,140 @@ To enable age-based filtering:
    pip install deepface tf-keras
    ```
 
-2. Enable in code:
+2. Enable it in the configuration:
    ```python
    ENABLE_AGE_DETECTION = True
    ```
 
-### GPU Acceleration
+Age estimation from a video frame has a meaningful margin of error. Treat this feature as a supplementary filter, not a sole safeguard, particularly in child-safety contexts.
 
-For faster processing, ensure you have CUDA-compatible GPU and install:
+### GPU acceleration
+
+For faster processing, install a CUDA-compatible build of PyTorch:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 ```
 
-## 📊 Model Information
+## Model Information
 
-- **Model**: YOLOv8n (Nano) - Custom trained
-- **Training Dataset**: COCO 2017 (80 object classes)
-- **Training Time**: 3-8 hours (hardware dependent)
-- **Primary Detection**: Person class (class 0)
-- **Confidence Threshold**: 0.6 (adjustable)
+| Property | Value |
+|---|---|
+| Model | YOLOv8n (Nano), custom trained |
+| Training dataset | COCO 2017 (80 object classes) |
+| Training time | 3 to 8 hours, hardware dependent |
+| Primary detection target | Person class (class 0) |
+| Default confidence threshold | 0.6 (adjustable) |
 
-## 🔐 Kaggle API Setup
+## Kaggle API Setup
 
-Required for downloading the COCO dataset:
+Required only if you plan to train your own model, since it downloads the COCO dataset:
 
 1. Go to https://www.kaggle.com/settings
-2. Scroll to API section
+2. Scroll to the API section
 3. Click "Create New API Token"
-4. Place `kaggle.json` in:
+4. Place the downloaded `kaggle.json` file in:
    - Windows: `C:\Users\<YourUsername>\.kaggle\kaggle.json`
    - Linux/Mac: `~/.kaggle/kaggle.json`
 
-## 🎛️ Troubleshooting
+## Troubleshooting
 
-### Camera not opening
-```bash
-# Try different camera index
-cap = cv2.VideoCapture(1)  # Change from 0 to 1
+**Camera not opening**
+```python
+cap = cv2.VideoCapture(1)  # Try a different camera index
 ```
 
-### Face cascade not loading
-The system automatically tries OpenCV's built-in cascade. If face filter is disabled, detection still works.
+**Face cascade not loading**
+The system automatically tries OpenCV's built-in cascade. If the face filter fails to load, detection still works without it.
 
-### Alarm not playing
-- Ensure `alarm.wav` exists, or system will use beep sound
-- Check volume settings
-- Verify file format is WAV
+**Alarm not playing**
+- Confirm `alarm.wav` exists, or the system will fall back to a beep
+- Check system volume
+- Confirm the file is a valid WAV file
 
-### Low FPS
-- Use smaller camera resolution
+**Low FPS**
+- Use a smaller camera resolution
 - Disable age detection
-- Ensure GPU is being used
-- Use YOLOv8n (nano) model
+- Confirm the GPU is actually being used for inference
+- Use the YOLOv8n (nano) model variant
 
-### Import errors
+**Zone editor shows "no camera feed"**
+Confirm `detect_danger_zone.py` is currently running - it is the only process that writes the reference image the editor displays.
+
+**Zone editor changes not appearing in the detector**
+Confirm the change was actually saved (the Save All button in the editor) and allow a few seconds for the detector's periodic file check to pick it up.
+
+**Import errors**
 ```bash
-# Reinstall dependencies
 pip install --upgrade --force-reinstall -r requirements.txt
 ```
 
-### Training taking too long
-- Use GPU if available
-- Reduce epochs in train_model.py (line 116)
-- Reduce batch size if out of memory
-- Use smaller model variant
+**Training taking too long**
+- Use a GPU if available
+- Reduce epochs in `train_model.py`
+- Reduce batch size if running out of memory
+- Use a smaller model variant
 
-## 🎯 Use Cases
+## Use Cases
 
-- **Child Safety**: Monitor swimming pools, construction zones
-- **Restricted Areas**: Server rooms, hazardous zones
-- **Security**: Unauthorized access detection
-- **Industrial Safety**: Dangerous machinery areas
-- **Home Safety**: Stairs, balconies for toddlers
+- Child safety monitoring around swimming pools or construction zones
+- Restricted area monitoring for server rooms or hazardous zones
+- Unauthorized access detection
+- Industrial safety around dangerous machinery
+- Home safety around stairs or balconies for young children
 
-## 📝 Performance
+## Performance
 
 | Model | FPS (CPU) | FPS (GPU) | Accuracy |
-|-------|-----------|-----------|----------|
+|---|---|---|---|
 | YOLOv8n | 15-25 | 60-100 | High |
 | YOLOv8s | 10-15 | 45-80 | Higher |
 | YOLOv8m | 5-10 | 30-60 | Highest |
 
-## 📈 Training Details
+## Training Details
 
 The model is trained using:
-- **Dataset**: COCO 2017 (118K training images, 5K validation)
-- **Epochs**: 50 (with early stopping)
-- **Image Size**: 640x640
-- **Batch Size**: 16
-- **Optimizer**: AdamW
-- **Loss Functions**: Box loss, Class loss, DFL loss
 
-Training outputs are saved in `runs/train/danger_zone_detector/`
+- Dataset: COCO 2017 (118K training images, 5K validation images)
+- Epochs: 50, with early stopping
+- Image size: 640x640
+- Batch size: 16
+- Optimizer: AdamW
+- Loss functions: Box loss, class loss, DFL loss
 
-## 🤝 Contributing
+Training outputs are saved in `runs/train/danger_zone_detector/`.
 
-Suggestions and improvements welcome! Areas for enhancement:
-- Multi-camera support
-- Cloud storage for alerts
-- Mobile app notifications
-- Sound level detection
-- Motion tracking
+## Contributing
 
-## ⚠️ Disclaimer
+Suggestions and improvements are welcome. Areas of particular interest:
+
+- Multi-camera / multi-room support
+- Object tracking to reduce false-positive alarms from single-frame flicker
+- Cloud storage for incident evidence
+- Mobile or email/SMS notifications
+- A dashboard for browsing incident history
+
+## Disclaimer
 
 This is a demonstration project. For production safety systems, consider:
+
 - Redundant sensors
 - Professional-grade cameras
 - Backup power systems
 - Regular maintenance
 - Professional installation
 
-## 📜 License
+## License
 
-MIT License - Feel free to use and modify for your projects.
+MIT License. Free to use and modify for your own projects.
 
-## 🙏 Credits
+## Credits
 
-- **YOLOv8**: Ultralytics
-- **COCO Dataset**: Microsoft COCO
-- **OpenCV**: Open Source Computer Vision Library
-- **DeepFace**: Age detection library
+- YOLOv8 - Ultralytics
+- COCO Dataset - Microsoft COCO
+- OpenCV - Open Source Computer Vision Library
+- DeepFace - Age detection library
 
 ---
 
-**Made with ❤️ for Safety and Security**
-
-For questions or issues, please create an issue in the repository.
+For questions or issues, please open an issue in the repository.
