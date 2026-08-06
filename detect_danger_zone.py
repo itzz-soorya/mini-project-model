@@ -590,15 +590,88 @@ def zone_contains_point(x, y, zone):
     return False
 
 
+def _rect_circle_overlap(px1, py1, px2, py2, cx, cy, r):
+    """True rectangle-vs-circle intersection: find the point on the box
+    closest to the circle's center, then check if that point is within
+    the radius."""
+    closest_x = max(px1, min(cx, px2))
+    closest_y = max(py1, min(cy, py2))
+    dx, dy = cx - closest_x, cy - closest_y
+    return (dx * dx + dy * dy) <= r * r
+
+
+def _segments_intersect(a1, a2, b1, b2):
+    """Standard orientation-based line-segment intersection test."""
+    def orientation(p, q, r):
+        val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+        if val == 0:
+            return 0
+        return 1 if val > 0 else 2
+
+    def on_segment(p, q, r):
+        return (min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and
+                min(p[1], r[1]) <= q[1] <= max(p[1], r[1]))
+
+    o1, o2 = orientation(a1, a2, b1), orientation(a1, a2, b2)
+    o3, o4 = orientation(b1, b2, a1), orientation(b1, b2, a2)
+
+    if o1 != o2 and o3 != o4:
+        return True
+    if o1 == 0 and on_segment(a1, b1, a2):
+        return True
+    if o2 == 0 and on_segment(a1, b2, a2):
+        return True
+    if o3 == 0 and on_segment(b1, a1, b2):
+        return True
+    if o4 == 0 and on_segment(b1, a2, b2):
+        return True
+    return False
+
+
+def _rect_polygon_overlap(px1, py1, px2, py2, points):
+    """True rectangle-vs-polygon intersection: covers full containment
+    either way, plus partial edge-crossing overlap (e.g. the zone outline
+    cuts across a corner of the person's box without either shape being
+    fully inside the other)."""
+    if len(points) < 3:
+        return False
+
+    box_corners = [(px1, py1), (px2, py1), (px2, py2), (px1, py2)]
+    freehand_zone = {"type": "freehand", "points": points}
+
+    # Any polygon vertex inside the box.
+    for (x, y) in points:
+        if px1 <= x <= px2 and py1 <= y <= py2:
+            return True
+
+    # Any box corner inside the polygon (covers the box being fully
+    # inside the polygon, or the polygon fully inside the box).
+    for corner in box_corners:
+        if zone_contains_point(corner[0], corner[1], freehand_zone):
+            return True
+
+    # Any box edge crossing any polygon edge (covers partial overlap
+    # where neither shape contains a vertex of the other).
+    n = len(points)
+    for i in range(n):
+        p3, p4 = points[i], points[(i + 1) % n]
+        for j in range(4):
+            b1, b2 = box_corners[j], box_corners[(j + 1) % 4]
+            if _segments_intersect(b1, b2, p3, p4):
+                return True
+
+    return False
+
+
 def person_in_zone_check(px1, py1, px2, py2, zone):
     """
-    Check whether a detected person is inside the given zone.
-    Rectangle: standard box-overlap test (unchanged from before).
-    Circle / Freehand: uses the person's foot-point (bottom-center of their
-    bounding box) tested against the ACTUAL shape geometry via
-    zone_contains_point, instead of approximating with the zone's bounding
-    box. This avoids false positives near the corners of a circle/freehand
-    zone's bounding rectangle where no real overlap exists.
+    Check whether a detected person's bounding box overlaps the given zone.
+    All three shapes now use true geometric overlap against the person's
+    full box (not a single reference point), so a zone drawn over any part
+    of a person - not just their feet - correctly counts them as inside.
+    This matters for close-range/webcam framing where a person's box can
+    extend well beyond the visible frame in either direction, not just
+    top-down/floor-level camera setups.
     """
     shape_type = zone.get("type")
 
@@ -606,12 +679,12 @@ def person_in_zone_check(px1, py1, px2, py2, zone):
         zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
         return px1 < zx2 and px2 > zx1 and py1 < zy2 and py2 > zy1
 
-    # Foot-point: bottom-center of the person's box, i.e. where they're
-    # standing. More representative of "is this person in the zone" than
-    # the full box for non-rectangular shapes.
-    foot_x = (px1 + px2) // 2
-    foot_y = py2
-    return zone_contains_point(foot_x, foot_y, zone)
+    elif shape_type == "circle":
+        cx, cy, r = zone["cx"], zone["cy"], zone["radius"]
+        return _rect_circle_overlap(px1, py1, px2, py2, cx, cy, r)
+
+    elif shape_type == "freehand":
+        return _rect_polygon_overlap(px1, py1, px2, py2, zone.get("points", []))
 
 
 # ==================== SMART INCIDENT EVIDENCE STORAGE ====================
