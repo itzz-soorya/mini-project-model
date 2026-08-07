@@ -1,9 +1,15 @@
 # Core Dependencies
 ultralytics>=8.0.0
-opencv-python>=4.8.0
+
+# Pinned below 5.0.0: OpenCV 5.0 moved CascadeClassifier (Haar face
+# detection) out of the main package into opencv-contrib-python. This
+# project uses CascadeClassifier directly, so stay on 4.x unless that
+# code is updated to match. See the README troubleshooting section.
+opencv-python<5.0.0
+
 numpy>=1.24.0
 
-# Dataset Download
+# Dataset Download (Optional - only needed for download_dataset.py / custom training)
 kagglehub>=0.2.0
 
 # Arduino Serial Communication
@@ -12,6 +18,9 @@ pyserial>=3.5
 # Age Detection (Optional - only needed if ENABLE_AGE_DETECTION=True)
 deepface>=0.0.79
 tf-keras>=2.15.0
+
+# Browser-Based Zone Editor (Optional - only needed to run zone_server.py)
+flask>=3.0.0
 
 # Additional dependencies
 pillow>=10.0.0
