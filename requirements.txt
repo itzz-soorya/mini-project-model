@@ -21,6 +21,7 @@ tf-keras>=2.15.0
 
 # Browser-Based Zone Editor (Optional - only needed to run zone_server.py)
 flask>=3.0.0
+python-dotenv>=1.0.0
 
 # Additional dependencies
 pillow>=10.0.0

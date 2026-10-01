@@ -764,6 +764,8 @@ def start_incident(zone, current_people, evidence_frame):
         "video_writer": video_writer,
     }
 
+    append_incident_log(zone_incident_state[zone_id], zone_id, current_people)
+
     if video_writer.isOpened():
         video_writer.write(evidence_frame)
 
@@ -835,8 +837,34 @@ def update_summary(date_str):
         f.write("\n".join(lines) + "\n")
 
 
+def append_incident_log(state, zone_id, people_count):
+    """Publish a new incident as soon as its evidence image is captured."""
+    day_dir = os.path.join(EVIDENCE_ROOT, state["date"])
+    csv_path = os.path.join(day_dir, "incident_log.csv")
+    row = {
+        "Date": state["date"],
+        "Time": state["time"],
+        "Zone ID": zone_id,
+        "Zone Name": state["zone_name"],
+        "People Count": people_count,
+        "Allowed Count": state["max_allowed"],
+        "Image": state["image_filename"],
+        "Video": state["video_filename"],
+        "Status": "RECORDING",
+    }
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        csv_writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        if write_header:
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+        f.flush()
+    update_summary(state["date"])
+
+
 def finalize_incident(zone_id):
-    """Close the video, append the CSV row, and refresh summary.txt."""
+    """Close the video, update the published row, and refresh summary.txt."""
     state = zone_incident_state.get(zone_id)
     if not state or not state["active"]:
         return
@@ -852,24 +880,21 @@ def finalize_incident(zone_id):
     day_dir = os.path.join(EVIDENCE_ROOT, date_str)
     csv_path = os.path.join(day_dir, "incident_log.csv")
 
-    row = {
-        "Date": date_str,
-        "Time": state["time"],
-        "Zone ID": zone_id,
-        "Zone Name": state["zone_name"],
-        "People Count": state["peak_count"],
-        "Allowed Count": state["max_allowed"],
-        "Image": state["image_filename"],
-        "Video": state["video_filename"],
-        "Status": "VIOLATION",
-    }
+    with open(csv_path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
 
-    write_header = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="") as f:
+    for row in rows:
+        if (row.get("Zone ID") == str(zone_id)
+                and row.get("Time") == state["time"]
+                and row.get("Image") == state["image_filename"]):
+            row["People Count"] = state["peak_count"]
+            row["Status"] = "VIOLATION"
+            break
+
+    with open(csv_path, "w", newline="") as f:
         csv_writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
-        if write_header:
-            csv_writer.writeheader()
-        csv_writer.writerow(row)
+        csv_writer.writeheader()
+        csv_writer.writerows(rows)
 
     update_summary(date_str)
 

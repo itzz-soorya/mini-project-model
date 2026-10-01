@@ -85,7 +85,7 @@ Drawing and adjusting zones by hand in the OpenCV window is fine for a first pas
 
 ### How it works
 
-`detect_danger_zone.py` saves its zone configuration to `zones.json` and continuously refreshes a reference image (`zone_reference.jpg`) from the live camera feed while it runs. A separate local server, `zone_server.py`, serves a browser page (`zone_editor.html`) that reads and writes the same `zones.json` file, using the reference image as a near-live background to draw on.
+`detect_danger_zone.py` saves its zone configuration to `zones.json` and continuously refreshes a reference image (`zone_reference.jpg`) from the live camera feed while it runs. A separate local server, `zone_server.py`, serves a dashboard (`dashboard.html`) at the root URL and loads the password-protected zone editor (`zone_editor.html`) when you choose Zone Editor. Both pages read and write the same `zones.json` file, using the reference image as a near-live background to draw on.
 
 ### Running the editor
 
@@ -95,6 +95,9 @@ python zone_server.py
 ```
 
 Then open `http://localhost:5000` in a browser.
+
+The editor password is loaded from the project `.env` file as
+`ZONE_EDITOR_PASSWORD`. Keep this file private and do not commit it.
 
 ### What you can do in the editor
 
@@ -142,7 +145,8 @@ mini-project-model/
 ├── coco2017/                       Downloaded COCO dataset (created by download_dataset.py)
 ├── detect_danger_zone.py           Main detection application
 ├── zone_server.py                  Local server for the browser-based zone editor
-├── zone_editor.html                Browser zone editor (served by zone_server.py)
+├── dashboard.html                  Incident dashboard (served at the root URL)
+├── zone_editor.html                Browser zone editor (served at /zone_editor)
 ├── zones.json                      Saved zone configuration (created automatically)
 ├── zone_reference.jpg              Live reference image for the editor (created automatically)
 ├── train_model.py                  Model training script

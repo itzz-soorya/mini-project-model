@@ -6,7 +6,8 @@ Tiny local server that lets zone_editor.html do CRUD on zones.json.
 A browser page can't read/write files on your disk directly, so this
 provides three small endpoints:
 
-    GET  /                -> serves zone_editor.html
+    GET  /                -> serves dashboard.html
+    GET  /zone_editor     -> serves zone_editor.html after authentication
     GET  /api/zones        -> returns the current contents of zones.json
     POST /api/zones        -> overwrites zones.json with the posted data
     GET  /zone_reference.jpg -> serves the camera frame that
@@ -19,7 +20,8 @@ Run this alongside (before or after) detect_danger_zone.py:
     pip install flask
     python zone_server.py
 
-Then open http://localhost:5000 in a browser.
+Then open http://localhost:5000 in a browser (dashboard).
+The Zone Editor button on the dashboard asks for the password set below.
 
 Both this server and detect_danger_zone.py read/write the SAME zones.json
 file in this folder, so:
@@ -34,15 +36,43 @@ actually running - it owns the camera and writes zone_reference.jpg itself,
 since most webcams only allow one program to access them at a time.
 """
 
+import csv
+import hmac
 import json
 import os
-from flask import Flask, jsonify, request, send_from_directory
+import re
+import secrets
+import time
+from functools import wraps
+from flask import Flask, jsonify, request, send_from_directory, abort
+from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 ZONES_FILE = os.path.join(BASE_DIR, "zones.json")
 SNAPSHOT_FILE = os.path.join(BASE_DIR, "zone_reference.jpg")
+EVIDENCE_DIR = os.path.join(BASE_DIR, "evidence")
+
+# ---- Zone Editor password -------------------------------------------------
+EDITOR_PASSWORD = os.environ.get("ZONE_EDITOR_PASSWORD", "")
+AUTH_COOKIE = "zone_editor_token"
+_valid_tokens = set()          # in memory only - everyone is logged out when the server restarts
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 app = Flask(__name__)
+
+
+def is_authed():
+    return request.cookies.get(AUTH_COOKIE) in _valid_tokens
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_authed():
+            return jsonify({"error": "Password required"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 def read_zones():
@@ -64,7 +94,94 @@ def write_zones(data):
 
 @app.route("/")
 def index():
-    return send_from_directory(BASE_DIR, "zone_editor.html")
+    return send_from_directory(BASE_DIR, "dashboard.html")
+
+
+@app.route("/zone_editor")
+@require_auth
+def zone_editor():
+    resp = send_from_directory(BASE_DIR, "zone_editor.html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---------------- password gate ----------------
+@app.route("/api/auth", methods=["GET"])
+def auth_status():
+    return jsonify({"authed": is_authed()})
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    body = request.get_json(force=True, silent=True) or {}
+    supplied = str(body.get("password", ""))
+    if not hmac.compare_digest(supplied.encode(), EDITOR_PASSWORD.encode()):
+        time.sleep(1)   # slow down guessing
+        return jsonify({"error": "Wrong password"}), 401
+    token = secrets.token_urlsafe(32)
+    _valid_tokens.add(token)
+    resp = jsonify({"status": "ok"})
+    resp.set_cookie(AUTH_COOKIE, token, httponly=True, samesite="Strict")
+    return resp
+
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    _valid_tokens.discard(request.cookies.get(AUTH_COOKIE))
+    resp = jsonify({"status": "ok"})
+    resp.delete_cookie(AUTH_COOKIE)
+    return resp
+
+
+# ---------------- evidence / dashboard data ----------------
+@app.route("/api/evidence/dates")
+def evidence_dates():
+    if not os.path.isdir(EVIDENCE_DIR):
+        resp = jsonify({"dates": []})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    dates = [d for d in os.listdir(EVIDENCE_DIR)
+             if DATE_RE.match(d) and os.path.isdir(os.path.join(EVIDENCE_DIR, d))]
+    resp = jsonify({"dates": sorted(dates, reverse=True)})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/evidence/<date>")
+def evidence_day(date):
+    if not DATE_RE.match(date):
+        abort(400)
+    day_dir = os.path.join(EVIDENCE_DIR, date)
+    csv_path = os.path.join(day_dir, "incident_log.csv")
+    incidents = []
+    if os.path.exists(csv_path):
+        try:
+            with open(csv_path, "r", newline="") as f:
+                for row in csv.DictReader(f):
+                    incidents.append({
+                        "time": row.get("Time", ""),
+                        "zone_id": row.get("Zone ID", ""),
+                        "zone_name": row.get("Zone Name", ""),
+                        "people": int(row.get("People Count") or 0),
+                        "allowed": int(row.get("Allowed Count") or 0),
+                        "image": row.get("Image", ""),
+                        "video": row.get("Video", ""),
+                        "status": row.get("Status", ""),
+                    })
+        except (OSError, ValueError, csv.Error):
+            pass
+    incidents.sort(key=lambda r: r["time"], reverse=True)
+    resp = jsonify({"date": date, "incidents": incidents})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/evidence/<date>/<kind>/<filename>")
+def evidence_file(date, kind, filename):
+    # only the two known sub-folders, only a valid date folder - no path tricks
+    if not DATE_RE.match(date) or kind not in ("images", "videos"):
+        abort(404)
+    return send_from_directory(os.path.join(EVIDENCE_DIR, date, kind), filename, conditional=True)
 
 
 @app.route("/zone_reference.jpg")
@@ -84,6 +201,7 @@ def get_zones():
 
 
 @app.route("/api/zones", methods=["POST"])
+@require_auth
 def save_zones():
     payload = request.get_json(force=True, silent=True)
 
@@ -145,6 +263,9 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Zones file:     {ZONES_FILE}")
     print(f"Snapshot file:  {SNAPSHOT_FILE}")
+    print(f"Evidence folder: {EVIDENCE_DIR}")
+    if not EDITOR_PASSWORD:
+        print("!! ZONE_EDITOR_PASSWORD is missing from .env")
     print("Open this in your browser:  http://localhost:5000")
     print("=" * 60)
     app.run(host="127.0.0.1", port=5000, debug=False)

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Danger Zone Dashboard</title>
+<style>
+  :root {
+    --bg:#14161a; --panel:#1d2027; --panel-alt:#262a33; --border:#333844;
+    --text:#e7e9ee; --dim:#9aa0ab; --accent:#4f8cff; --danger:#ff5c5c; --ok:#38c172;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  button,select { font:inherit; font-size:13px; color:var(--text); background:var(--panel-alt); border:1px solid var(--border); border-radius:6px; padding:8px 12px; cursor:pointer; }
+  button:hover,select:hover { background:#2f3542; }
+  button:focus-visible,select:focus-visible,input:focus-visible,.card:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { background:#3d7ae0; }
+
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:14px 22px; background:var(--panel); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:18px; margin:0; margin-right:auto; }
+  header h1 small { display:block; font-size:12px; font-weight:400; color:var(--dim); margin-top:2px; }
+  #editorBtn { display:flex; align-items:center; gap:7px; }
+  #editorBtn svg { width:14px; height:14px; }
+
+  main { padding:22px; max-width:1300px; margin:0 auto; }
+
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:22px; }
+  .stat { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+  .stat b { display:block; font-size:28px; font-weight:650; line-height:1.1; }
+  .stat span { color:var(--dim); font-size:12.5px; }
+  .stat.hot b { color:var(--danger); }
+
+  .zoneBars { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px 16px; margin-bottom:22px; }
+  .zoneBars h2,.listHead h2 { font-size:14px; margin:0 0 10px; }
+  .bar { display:grid; grid-template-columns:120px 1fr 90px; gap:10px; align-items:center; font-size:12.5px; margin:6px 0; }
+  .bar .track { height:8px; background:var(--panel-alt); border-radius:4px; overflow:hidden; }
+  .bar .fill { height:100%; background:var(--danger); border-radius:4px; }
+  .bar .n { color:var(--dim); text-align:right; }
+
+  .listHead { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:12px; }
+  .listHead h2 { margin:0 auto 0 0; }
+  .chip { padding:5px 11px; border-radius:16px; font-size:12.5px; }
+  .chip.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; cursor:pointer; }
+  .card:hover { border-color:var(--accent); }
+  .card .thumb { aspect-ratio:16/9; width:100%; object-fit:cover; display:block; background:#000; }
+  .card .info { padding:10px 12px; display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+  .card .info strong { display:block; font-size:14px; }
+  .card .info span { font-size:12.5px; color:var(--dim); }
+  .over { color:var(--danger); font-weight:600; font-size:13px; white-space:nowrap; }
+
+  .empty { grid-column:1/-1; text-align:center; color:var(--dim); padding:50px 10px; line-height:1.6; background:var(--panel); border:1px dashed var(--border); border-radius:8px; }
+
+  /* overlays */
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.72); display:none; align-items:center; justify-content:center; z-index:20; padding:18px; }
+  .overlay.open { display:flex; }
+  .dialog { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:20px; width:100%; max-width:380px; }
+  .dialog h3 { margin:0 0 6px; font-size:16px; }
+  .dialog p { margin:0 0 14px; color:var(--dim); font-size:13px; }
+  .dialog input { width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:10px; font-size:14px; margin-bottom:10px; }
+  .dialog .row { display:flex; gap:8px; justify-content:flex-end; margin-top:4px; }
+  #pwErr { color:var(--danger); font-size:12.5px; min-height:18px; }
+
+  .viewer { max-width:960px; max-height:94vh; overflow:auto; }
+  .viewer .top { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+  .viewer .top h3 { margin:0; }
+  .viewer .tabs { display:flex; gap:6px; margin-bottom:10px; }
+  .viewer img,.viewer video { width:100%; border-radius:6px; background:#000; display:block; max-height:68vh; object-fit:contain; }
+  #vidFail { display:none; padding:30px 14px; text-align:center; color:var(--dim); background:var(--bg); border-radius:6px; line-height:1.6; }
+  #vidFail a { color:var(--accent); }
+  .meta { margin-top:10px; font-size:13px; color:var(--dim); }
+
+  #editorLayer { position:fixed; inset:0; background:var(--bg); z-index:30; display:none; flex-direction:column; }
+  #editorLayer.open { display:flex; }
+  #editorLayer .bar2 { display:flex; align-items:center; gap:10px; padding:8px 14px; background:var(--panel); border-bottom:1px solid var(--border); }
+  #editorLayer .bar2 span { margin-right:auto; font-size:13px; color:var(--dim); }
+  #editorFrame { flex:1; border:0; width:100%; }
+
+  @media (max-width:600px) { header,main { padding-left:14px; padding-right:14px; } .bar { grid-template-columns:80px 1fr 70px; } }
+  @media (prefers-reduced-motion:reduce) { * { transition:none !important; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Danger Zone Dashboard<small id="updated">Loading...</small></h1>
+  <select id="dateSel" aria-label="Choose date"></select>
+  <button id="refreshBtn">Refresh</button>
+  <button id="editorBtn" class="primary">
+    <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1a3.5 3.5 0 0 0-3.5 3.5V6H4a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-.5V4.5A3.5 3.5 0 0 0 8 1Zm2 5H6V4.5a2 2 0 1 1 4 0V6Z"/></svg>
+    Zone Editor
+  </button>
+</header>
+
+<main>
+  <section class="stats" id="stats"></section>
+  <section class="zoneBars" id="zoneBars" style="display:none"><h2>Violations by zone</h2><div id="bars"></div></section>
+  <div class="listHead"><h2>Recorded incidents</h2><div id="chips" style="display:flex;gap:6px;flex-wrap:wrap"></div></div>
+  <section class="grid" id="grid"></section>
+</main>
+
+<!-- password -->
+<div class="overlay" id="pwOverlay" role="dialog" aria-modal="true" aria-labelledby="pwTitle">
+  <div class="dialog">
+    <h3 id="pwTitle">Zone Editor is locked</h3>
+    <p>Enter the password to edit danger zones.</p>
+    <input type="password" id="pwInput" placeholder="Password" autocomplete="current-password">
+    <div id="pwErr"></div>
+    <div class="row"><button id="pwCancel">Cancel</button><button id="pwOk" class="primary">Unlock</button></div>
+  </div>
+</div>
+
+<!-- incident viewer -->
+<div class="overlay" id="viewOverlay" role="dialog" aria-modal="true">
+  <div class="dialog viewer">
+    <div class="top"><h3 id="vTitle"></h3><button id="vClose">Close</button></div>
+    <div class="tabs"><button id="tabImg" class="chip on">Photo</button><button id="tabVid" class="chip">Video</button></div>
+    <img id="vImg" alt="Incident snapshot">
+    <video id="vVid" controls preload="metadata" style="display:none"></video>
+    <div id="vidFail"></div>
+    <div class="meta" id="vMeta"></div>
+  </div>
+</div>
+
+<!-- editor (the existing zone_editor.html, loaded only after unlock) -->
+<div id="editorLayer">
+  <div class="bar2"><span>Zone Editor</span><button id="backBtn">Back to dashboard</button><button id="lockBtn">Lock and exit</button></div>
+  <iframe id="editorFrame" title="Zone Editor"></iframe>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let incidents = [], zoneFilter = 'all', currentDate = '', dates = [];
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fileUrl = (kind, name) => `/evidence/${currentDate}/${kind}/${encodeURIComponent(name)}`;
+
+/* ---------- data ---------- */
+async function loadDates(keep) {
+  try {
+    const d = await (await fetch('/api/evidence/dates')).json();
+    dates = d.dates;
+  } catch { dates = []; $('updated').textContent = 'Cannot reach zone_server.py - is it running?'; }
+  $('dateSel').innerHTML = dates.length ? dates.map(x => `<option>${x}</option>`).join('') : '<option>No recordings</option>';
+  currentDate = (keep && dates.includes(currentDate)) ? currentDate : (dates[0] || '');
+  if (currentDate) $('dateSel').value = currentDate;
+  await loadDay();
+}
+
+async function loadDay() {
+  incidents = [];
+  if (currentDate) {
+    try { incidents = (await (await fetch('/api/evidence/' + currentDate)).json()).incidents; } catch {}
+    $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  }
+  if (zoneFilter !== 'all' && !incidents.some(i => i.zone_id === zoneFilter)) zoneFilter = 'all';
+  render();
+}
+
+/* ---------- render ---------- */
+function render() {
+  const total = incidents.length;
+  const zoneMap = {};
+  incidents.forEach(i => {
+    const z = zoneMap[i.zone_id] ||= { name: i.zone_name || 'Zone ' + i.zone_id, n: 0 };
+    z.n++;
+  });
+  const zoneIds = Object.keys(zoneMap).sort((a, b) => a - b);
+  const times = incidents.map(i => i.time).sort();
+  const peak = incidents.reduce((m, i) => Math.max(m, i.people), 0);
+
+  $('stats').innerHTML = [
+    [total, 'Incidents on ' + (currentDate || '-'), total ? 'hot' : ''],
+    [zoneIds.length, 'Zones affected', ''],
+    [peak || '-', 'Highest people count', ''],
+    [total ? times[0] : '-', 'First incident', ''],
+    [total ? times[times.length - 1] : '-', 'Last incident', '']
+  ].map(([v, l, c]) => `<div class="stat ${c}"><b>${esc(v)}</b><span>${esc(l)}</span></div>`).join('');
+
+  $('zoneBars').style.display = total ? 'block' : 'none';
+  const maxN = Math.max(1, ...zoneIds.map(z => zoneMap[z].n));
+  $('bars').innerHTML = zoneIds.map(z => `<div class="bar"><span>${esc(zoneMap[z].name)}</span>
+    <div class="track"><div class="fill" style="width:${zoneMap[z].n / maxN * 100}%"></div></div>
+    <span class="n">${zoneMap[z].n} violation${zoneMap[z].n > 1 ? 's' : ''}</span></div>`).join('');
+
+  $('chips').innerHTML = zoneIds.length > 1
+    ? [['all', 'All zones'], ...zoneIds.map(z => [z, zoneMap[z].name])]
+        .map(([id, n]) => `<button class="chip ${zoneFilter === id ? 'on' : ''}" data-z="${esc(id)}">${esc(n)}</button>`).join('')
+    : '';
+  $('chips').querySelectorAll('button').forEach(b => b.onclick = () => { zoneFilter = b.dataset.z; render(); });
+
+  const shown = incidents.filter(i => zoneFilter === 'all' || i.zone_id === zoneFilter);
+  if (!shown.length) {
+    $('grid').innerHTML = `<div class="empty">${currentDate
+      ? 'No incidents recorded on this date.'
+      : 'No recordings yet.<br>Evidence appears here when a zone goes over its people limit while <code>detect_danger_zone.py</code> is running.'}</div>`;
+    return;
+  }
+  $('grid').innerHTML = shown.map((i, idx) => `
+    <div class="card" tabindex="0" data-i="${incidents.indexOf(i)}">
+      <img class="thumb" loading="lazy" src="${fileUrl('images', i.image)}" alt="Snapshot of ${esc(i.zone_name)} at ${esc(i.time)}">
+      <div class="info"><div><strong>${esc(i.zone_name)}</strong><span>${esc(i.time)}</span></div>
+      <div class="over">${i.people} / ${i.allowed}<br><span style="font-weight:400">people / max</span></div></div>
+    </div>`).join('');
+  $('grid').querySelectorAll('.card').forEach(c => {
+    const open = () => openViewer(incidents[+c.dataset.i]);
+    c.onclick = open;
+    c.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
+  });
+}
+
+/* ---------- incident viewer ---------- */
+function showTab(t) {
+  const vid = t === 'vid';
+  $('vImg').style.display = vid ? 'none' : 'block';
+  $('vVid').style.display = vid && $('vidFail').style.display !== 'block' ? 'block' : 'none';
+  if (!vid) $('vVid').pause();
+  $('tabImg').classList.toggle('on', !vid);
+  $('tabVid').classList.toggle('on', vid);
+}
+function openViewer(i) {
+  $('vTitle').textContent = `${i.zone_name} - ${currentDate} ${i.time}`;
+  $('vImg').src = fileUrl('images', i.image);
+  const v = $('vVid'), fail = $('vidFail');
+  fail.style.display = 'none';
+  v.onerror = () => {
+    fail.innerHTML = `This browser can't play the recorded video format.<br><a href="${fileUrl('videos', i.video)}" download>Download the video</a> and open it in a media player.`;
+    fail.style.display = 'block'; v.style.display = 'none';
+  };
+  v.src = fileUrl('videos', i.video);
+  $('vMeta').textContent = `Peak ${i.people} people, ${i.allowed} allowed. Status: ${i.status || 'VIOLATION'}.`;
+  showTab('img');
+  $('viewOverlay').classList.add('open');
+}
+function closeViewer() { $('vVid').pause(); $('vVid').removeAttribute('src'); $('viewOverlay').classList.remove('open'); }
+$('vClose').onclick = closeViewer;
+$('tabImg').onclick = () => showTab('img');
+$('tabVid').onclick = () => showTab('vid');
+$('viewOverlay').onclick = e => { if (e.target === $('viewOverlay')) closeViewer(); };
+
+/* ---------- zone editor (password gate) ---------- */
+function openEditor() {
+  $('editorFrame').src = '/zone_editor';
+  $('editorLayer').classList.add('open');
+}
+function closeEditor() {
+  $('editorLayer').classList.remove('open');
+  $('editorFrame').src = 'about:blank';
+}
+function askPassword() {
+  $('pwInput').value = ''; $('pwErr').textContent = '';
+  $('pwOverlay').classList.add('open');
+  setTimeout(() => $('pwInput').focus(), 30);
+}
+async function submitPassword() {
+  $('pwOk').disabled = true; $('pwErr').textContent = '';
+  try {
+    const r = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: $('pwInput').value }) });
+    if (r.ok) { $('pwOverlay').classList.remove('open'); openEditor(); }
+    else { $('pwErr').textContent = 'Wrong password. Try again.'; $('pwInput').select(); }
+  } catch { $('pwErr').textContent = 'Cannot reach zone_server.py.'; }
+  $('pwOk').disabled = false;
+}
+$('editorBtn').onclick = async () => {
+  try {
+    const a = await (await fetch('/api/auth')).json();
+    a.authed ? openEditor() : askPassword();
+  } catch { askPassword(); }
+};
+$('pwOk').onclick = submitPassword;
+$('pwInput').onkeydown = e => { if (e.key === 'Enter') submitPassword(); };
+$('pwCancel').onclick = () => $('pwOverlay').classList.remove('open');
+$('backBtn').onclick = closeEditor;
+$('lockBtn').onclick = async () => { await fetch('/api/logout', { method:'POST' }); closeEditor(); };
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if ($('viewOverlay').classList.contains('open')) closeViewer();
+  else if ($('pwOverlay').classList.contains('open')) $('pwOverlay').classList.remove('open');
+});
+
+/* ---------- init ---------- */
+$('dateSel').onchange = () => { currentDate = $('dateSel').value; zoneFilter = 'all'; loadDay(); };
+$('refreshBtn').onclick = () => loadDates(true);
+loadDates(false);
+setInterval(() => {   // auto-refresh while nothing is open on top of the dashboard
+  if (!document.querySelector('.overlay.open') && !$('editorLayer').classList.contains('open')) loadDates(true);
+}, 5000);
+</script>
+</body>
+</html>
