@@ -13,6 +13,10 @@ import math
 import csv
 import datetime
 import json
+import queue
+import shutil
+import subprocess
+import threading
 import numpy as np
 from deepface import DeepFace
 
@@ -73,13 +77,143 @@ else:
 
 # -------------------- CAMERA --------------------
 
-cap = cv2.VideoCapture(0)
+# -------------------- CAMERA (THREADED CAPTURE) --------------------
+#
+# Why a dedicated capture thread?
+#   cap.read() used to run in the SAME loop as YOLO inference, drawing and
+#   disk writes. While that loop was busy (YOLO = 50-200 ms/frame on CPU)
+#   nobody drained the camera driver's buffer, so frames piled up: the
+#   picture lagged behind real life, recordings came out "fast-forwarded",
+#   and a single failed read() ended the whole program.
+#
+#   Now ONE thread does nothing except read the camera at full speed and
+#   keep only the NEWEST frame (producer). Everybody else - UI, YOLO worker,
+#   incident recorder - just asks for the newest frame (consumers), so a
+#   slow consumer can never back up the camera. A Condition variable lets
+#   consumers sleep until a new frame really arrives (no busy-waiting).
 
-if not cap.isOpened():
+CAMERA_INDEX = 0
+
+
+class FrameGrabber(threading.Thread):
+    def __init__(self, source=CAMERA_INDEX):
+        super().__init__(daemon=True, name="FrameGrabber")
+        self.source = source
+        self._cond = threading.Condition()
+        self._frame = None
+        self._frame_id = 0
+        self._quit = threading.Event()
+        self.cap = self._open()
+
+    def _open(self):
+        """Try several Windows camera backends and accept the first one that
+        actually DELIVERS a frame (isOpened() alone can be True even when the
+        backend never produces video - that was the "no frames" error)."""
+        if os.name == "nt":
+            # DirectShow is more reliable for this threaded capture loop.
+            # CAP_ANY may select MSMF and stop delivering frames after the
+            # buffer-size configuration is applied.
+            backends = [("DirectShow", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF),
+                        ("default", cv2.CAP_ANY)]
+        else:
+            backends = [("default", cv2.CAP_ANY)]
+
+        for name, backend in backends:
+            cap = cv2.VideoCapture(self.source, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            # Configure the capture before validating it. Some Windows
+            # backends return one warm-up frame, then stop after this setting.
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            got_frame = False
+            successful_reads = 0
+            for _ in range(60):                    # MSMF can need a few secs to warm up
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    successful_reads += 1
+                    if successful_reads >= 5:
+                        got_frame = True
+                        break
+                time.sleep(0.1)
+            if got_frame:
+                print(f"✓ Camera backend in use: {name}")
+                return cap
+            print(f"⚠ Camera backend {name} opened but gave no frames - trying next")
+            cap.release()
+        return None
+
+    def run(self):
+        fails = 0
+        while not self._quit.is_set():
+            if self.cap is None:                       # camera lost -> keep retrying
+                time.sleep(1.0)
+                self.cap = self._open()
+                if self.cap is not None:
+                    print("✓ Camera reconnected")
+                continue
+
+            ok, frame = self.cap.read()
+            if not ok:
+                fails += 1
+                if fails >= 30:                        # ~1s of failures = camera dropped
+                    print("⚠ Camera stopped delivering frames - reconnecting...")
+                    self.cap.release()
+                    self.cap = None
+                    fails = 0
+                time.sleep(0.03)
+                continue
+
+            fails = 0
+            with self._cond:
+                self._frame = frame
+                self._frame_id += 1
+                self._cond.notify_all()
+
+    def wait_for_frame(self, last_id, timeout=1.0):
+        """Block until a frame NEWER than last_id exists. Returns (id, frame)
+        or (last_id, None) on timeout. Frame is shared - copy() before drawing."""
+        with self._cond:
+            self._cond.wait_for(
+                lambda: (self._frame is not None and
+                         self._frame_id != last_id) or self._quit.is_set(),
+                timeout)
+            if self._frame is None or self._frame_id == last_id:
+                return last_id, None
+            return self._frame_id, self._frame
+
+    def latest(self):
+        with self._cond:
+            return self._frame_id, self._frame
+
+    def stop(self):
+        self._quit.set()
+        with self._cond:
+            self._cond.notify_all()
+        self.join(timeout=2)
+        if self.cap is not None:
+            self.cap.release()
+
+
+grabber = FrameGrabber(CAMERA_INDEX)
+
+if grabber.cap is None:
     print("✗ Error: Could not open camera")
+    print("  - Close any other program using the camera (an old detect_danger_zone.py, Zoom, Teams, Camera app)")
+    print("  - Windows Settings > Privacy > Camera > allow desktop apps")
+    print("  - Try CAMERA_INDEX = 1")
     exit(1)
 
-print("✓ Camera initialized")
+grabber.start()
+_first_id, _first_frame = grabber.wait_for_frame(-1, timeout=15.0)
+if _first_frame is None:
+    print("✗ Error: Camera opened but delivered no frames")
+    grabber.stop()
+    exit(1)
+
+print("✓ Camera initialized (threaded capture)")
 
 # The HTML zone editor displays this file as its background so you can draw
 # zones on top of it. It's refreshed periodically from inside the main loop
@@ -201,8 +335,9 @@ def check_for_live_zone_updates():
     # Close out any in-progress incident recordings before swapping the
     # zone list out from under them - old zone ids may no longer exist
     # (or may now mean something different) after the reload.
-    finalize_all_active_incidents()
-    load_zones_from_file()
+    with processing_lock:      # don't swap zones while the worker is mid-frame
+        finalize_all_active_incidents()
+        load_zones_from_file()
     print("↻ zones.json changed on disk - live-reloaded zones")
 
 
@@ -479,46 +614,65 @@ print("\nSTARTING APPLICATION...\n")
 
 # -------------------- HELPER FUNCTIONS --------------------
 
-def play_alarm():
-    """Trigger 15V buzzer via Arduino"""
-    global arduino
+class AlarmController:
+    """Alarm runs in its own thread. Before, winsound.Beep(1000, 500) blocked
+    the main loop for half a second on every alarm trigger (frozen video).
+    Now the processing code just calls alarm.set(True/False) - instant, and
+    idempotent, so it can be called every frame."""
 
-    # IF-ELSE condition to check if Arduino is available
-    if ENABLE_ARDUINO_BUZZER and arduino:
+    def __init__(self):
+        self._on = threading.Event()
+        self._quit = threading.Event()
+        self._last = False
+        self._use_arduino = bool(ENABLE_ARDUINO_BUZZER and arduino)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="Alarm")
+        self._thread.start()
+
+    def set(self, active):
+        if active:
+            self._on.set()
+        else:
+            self._on.clear()
+
+    def _arduino_write(self, byte):
         try:
-            arduino.write(b'1')  # Send '1' to Arduino to turn ON buzzer
-            print("✓ Buzzer triggered (Arduino)")
+            arduino.write(byte)
+            return True
         except Exception as e:
-            print(f"Error sending to Arduino: {e}")
-            # Fallback to system beep
-            winsound.Beep(1000, 500)
-    else:
-        # Fallback to system beep if Arduino not available
-        try:
-            winsound.Beep(1000, 500)  # 1000 Hz for 500ms
-            print("✓ Alarm beep triggered (System)")
-        except Exception as e:
-            print(f"Warning: Could not play alarm - {e}")
+            print(f"Error sending to Arduino: {e} - falling back to system beep")
+            self._use_arduino = False
+            return False
+
+    def _run(self):
+        while not self._quit.is_set():
+            on = self._on.is_set()
+            if on != self._last:
+                self._last = on
+                if self._use_arduino:
+                    if self._arduino_write(b"1" if on else b"0"):
+                        print("✓ Buzzer triggered (Arduino)" if on else "✓ Buzzer stopped (Arduino)")
+                else:
+                    print("✓ Alarm beeping (System)" if on else "✓ Alarm stopped (System)")
+            if on and not self._use_arduino:
+                try:
+                    winsound.Beep(1000, 500)
+                except Exception:
+                    time.sleep(0.5)
+            else:
+                time.sleep(0.05)
+
+    def shutdown(self):
+        self._on.clear()
+        self._quit.set()
+        self._thread.join(timeout=2)
+        if self._use_arduino:
+            try:
+                arduino.write(b"0")
+            except Exception:
+                pass
 
 
-def stop_alarm():
-    """Stop 15V buzzer via Arduino"""
-    global arduino
-
-    # IF-ELSE condition to check if Arduino is available
-    if ENABLE_ARDUINO_BUZZER and arduino:
-        try:
-            arduino.write(b'0')  # Send '0' to Arduino to turn OFF buzzer
-            print("✓ Buzzer stopped (Arduino)")
-        except Exception as e:
-            print(f"Error sending to Arduino: {e}")
-    else:
-        # Stop system beep
-        try:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-            print("✓ Alarm stopped (System)")
-        except:
-            pass
+alarm = AlarmController()
 
 
 def draw_shape(frame, zone, color, thickness):
@@ -687,12 +841,151 @@ def person_in_zone_check(px1, py1, px2, py2, zone):
         return _rect_polygon_overlap(px1, py1, px2, py2, zone.get("points", []))
 
 
+# ==================== INCIDENT VIDEO RECORDER (OWN THREAD) ====================
+#
+# Previously frames were written to the VideoWriter from the YOLO loop, so
+# the clip got ONE frame per inference (e.g. 5 fps) but was tagged as 20 fps
+# -> wrong speed/length. Also 'mp4v' (MPEG-4 Part 2) can't be played by
+# browsers, which is why the dashboard said "can't play this video format".
+#
+# Now ONE thread owns every VideoWriter and writes the newest camera frame
+# at a fixed 20 fps clock, so clip duration == real time regardless of YOLO
+# speed. Clips are H.264 (browser-playable): written with 'avc1' if OpenCV
+# supports it, otherwise written as mp4v and re-encoded to H.264 with ffmpeg
+# in a background thread once the incident ends.
+
+RECORD_FPS = 20.0
+
+# One lock protects "evaluate zones + start/stop incidents", so the YOLO
+# worker, zone hot-reload and the R-reset can never interleave.
+processing_lock = threading.Lock()
+
+
+def find_ffmpeg():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg                      # pip install imageio-ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+FFMPEG_EXE = find_ffmpeg()
+print("✓ ffmpeg found - clips will be browser-playable H.264" if FFMPEG_EXE else
+      "⚠ ffmpeg not found - if the dashboard can't play videos run: pip install imageio-ffmpeg")
+
+
+def open_video_writer(path, fps, size):
+    for codec in ("avc1", "H264", "mp4v"):
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec), fps, size)
+        if writer.isOpened():
+            return writer, codec
+        writer.release()
+    return None, None
+
+
+def transcode_to_h264(path):
+    """Re-encode a finished clip in place to H.264/yuv420p (plays in browsers)."""
+    tmp = path[:-4] + "_h264.mp4"
+    try:
+        subprocess.run(
+            [FFMPEG_EXE, "-y", "-loglevel", "error", "-i", path,
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+             "-movflags", "+faststart", tmp],
+            check=True, timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"⚠ Could not convert {os.path.basename(path)} to H.264: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+class IncidentRecorder(threading.Thread):
+    def __init__(self, grabber, fps=RECORD_FPS):
+        super().__init__(daemon=True, name="IncidentRecorder")
+        self.grabber = grabber
+        self.fps = fps
+        self._clips = {}                 # key -> {"writer", "path", "codec"}
+        self._lock = threading.Lock()
+        self._quit = threading.Event()
+        self._post = []                  # background transcode threads
+
+    def start_clip(self, key, path):
+        _, frame = self.grabber.latest()
+        if frame is None:
+            return False
+        h, w = frame.shape[:2]
+        writer, codec = open_video_writer(path, self.fps, (w, h))
+        if writer is None:
+            print(f"✗ Could not open a video writer for {path}")
+            return False
+        with self._lock:
+            old = self._clips.pop(key, None)
+            self._clips[key] = {"writer": writer, "path": path, "codec": codec}
+            writer.write(frame)
+        if old:
+            self._finish(old)
+        return True
+
+    def stop_clip(self, key):
+        with self._lock:
+            clip = self._clips.pop(key, None)
+        if clip:
+            self._finish(clip)
+
+    def _finish(self, clip):
+        try:
+            clip["writer"].release()
+        except Exception:
+            pass
+        if clip["codec"] == "mp4v" and FFMPEG_EXE:
+            t = threading.Thread(target=transcode_to_h264, args=(clip["path"],), daemon=True)
+            t.start()
+            self._post = [p for p in self._post if p.is_alive()] + [t]
+
+    def run(self):
+        interval = 1.0 / self.fps
+        next_tick = time.perf_counter()
+        while not self._quit.is_set():
+            next_tick += interval
+            _, frame = self.grabber.latest()
+            if frame is not None:
+                with self._lock:
+                    for clip in self._clips.values():
+                        clip["writer"].write(frame)       # read-only use of shared frame
+            delay = next_tick - time.perf_counter()
+            if delay > 0:
+                self._quit.wait(delay)
+            else:
+                next_tick = time.perf_counter()           # fell behind -> resync clock
+
+    def shutdown(self):
+        self._quit.set()
+        self.join(timeout=2)
+        with self._lock:
+            keys = list(self._clips.keys())
+        for k in keys:
+            self.stop_clip(k)
+        for t in self._post:
+            t.join(timeout=60)
+
+
+recorder = IncidentRecorder(grabber)
+recorder.start()
+
+
 # ==================== SMART INCIDENT EVIDENCE STORAGE ====================
 #
 # Nothing here ever runs unless a zone actually exceeds its maximum-people
 # limit. No folders, files, or logs are created for a clean/compliant frame.
 
-EVIDENCE_ROOT = "evidence"
+EVIDENCE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidence")
 CSV_FIELDNAMES = [
     "Date", "Time", "Zone ID", "Zone Name",
     "People Count", "Allowed Count", "Image", "Video", "Status",
@@ -748,9 +1041,8 @@ def start_incident(zone, current_people, evidence_frame):
 
     cv2.imwrite(image_path, evidence_frame)
 
-    h, w = evidence_frame.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (w, h))
+    # Video is recorded by the IncidentRecorder thread on its own 20 fps clock.
+    recorder.start_clip(zone_id, video_path)
 
     zone_incident_state[zone_id] = {
         "active": True,
@@ -761,13 +1053,9 @@ def start_incident(zone, current_people, evidence_frame):
         "peak_count": current_people,
         "image_filename": image_filename,
         "video_filename": video_filename,
-        "video_writer": video_writer,
     }
 
     append_incident_log(zone_incident_state[zone_id], zone_id, current_people)
-
-    if video_writer.isOpened():
-        video_writer.write(evidence_frame)
 
 
 def continue_incident(zone_id, current_people, evidence_frame):
@@ -777,10 +1065,6 @@ def continue_incident(zone_id, current_people, evidence_frame):
         return
 
     state["peak_count"] = max(state["peak_count"], current_people)
-
-    writer = state.get("video_writer")
-    if writer is not None and writer.isOpened():
-        writer.write(evidence_frame)
 
 
 def update_summary(date_str):
@@ -869,12 +1153,7 @@ def finalize_incident(zone_id):
     if not state or not state["active"]:
         return
 
-    writer = state.get("video_writer")
-    if writer is not None:
-        try:
-            writer.release()
-        except Exception:
-            pass
+    recorder.stop_clip(zone_id)      # recorder thread closes (and converts) the clip
 
     date_str = state["date"]
     day_dir = os.path.join(EVIDENCE_ROOT, date_str)
@@ -891,10 +1170,18 @@ def finalize_incident(zone_id):
             row["Status"] = "VIOLATION"
             break
 
-    with open(csv_path, "w", newline="") as f:
+    tmp_csv = csv_path + ".tmp"
+    with open(tmp_csv, "w", newline="") as f:
         csv_writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         csv_writer.writeheader()
         csv_writer.writerows(rows)
+    try:
+        os.replace(tmp_csv, csv_path)
+    except PermissionError:          # Windows: file momentarily open elsewhere
+        with open(csv_path, "w", newline="") as f:
+            csv_writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            csv_writer.writeheader()
+            csv_writer.writerows(rows)
 
     update_summary(date_str)
 
@@ -928,20 +1215,242 @@ def finalize_all_active_incidents():
             finalize_incident(zone_id)
 
 
-# -------------------- MAIN LOOP --------------------
+def process_detection_frame(raw_frame, zones):
+    """Runs in the DetectionWorker thread. raw_frame is shared/read-only;
+    returns a NEW annotated frame."""
+    global frame_counter
+    frame = raw_frame.copy()
+    frame_counter += 1
+    results = model(frame, verbose=False)
+
+    # Clean snapshot of the raw camera frame, taken before any overlays
+    # are drawn, so incident evidence images/video are not cluttered.
+    evidence_frame = raw_frame   # untouched copy for evidence
+
+    # Boxes of every valid detected person this frame (for per-zone counting)
+    detected_person_boxes = []
+
+    for r in results:
+        for box in r.boxes:
+            cls = int(box.cls[0])
+            if model.names[cls] != "person":
+                continue
+
+            px1, py1, px2, py2 = map(int, box.xyxy[0])
+            conf = float(box.conf[0])
+
+            # ---------- BASIC CONFIDENCE FILTER ----------
+            if conf < 0.6:
+                continue
+
+            w = px2 - px1
+            h = py2 - py1
+            if w == 0 or h == 0:
+                continue
+
+            # ---------- ASPECT RATIO FILTER ----------
+            # Skip the filter for boxes touching the frame edge - they're
+            # partially cropped, so their aspect ratio is unreliable and
+            # shouldn't be used to reject a real detection.
+            frame_h, frame_w = frame.shape[:2]
+            touches_edge = (px1 <= 1 or py1 <= 1 or
+                             px2 >= frame_w - 1 or py2 >= frame_h - 1)
+
+            if not touches_edge:
+                aspect_ratio = h / w
+                # Widened lower bound (was 1) so crouching/bending/seated
+                # people aren't discarded just for being wider than tall.
+                if aspect_ratio > 4 or aspect_ratio < 0.5:
+                    continue
+
+            person_crop = frame[py1:py2, px1:px2]
+            if person_crop.size == 0:
+                continue
+
+            # ---------- FACE FILTER (only if age detection is enabled) ----------
+            if ENABLE_AGE_DETECTION and face_cascade is not None:
+                gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+                if len(faces) == 0:
+                    continue
+
+            # ---------- AGE ESTIMATION ----------
+            child_detected = True  # Default: detect all persons when age detection disabled
+            color = (0, 255, 0)
+            label = f"PERSON {conf:.2f}"
+
+            if ENABLE_AGE_DETECTION:
+                # Grid cell key for this person's rough position, used to
+                # cache their last age result between throttled checks.
+                grid_key = (px1 // AGE_CACHE_GRID, py1 // AGE_CACHE_GRID)
+                run_deepface = (frame_counter % AGE_CHECK_INTERVAL == 0) or (grid_key not in age_result_cache)
+
+                if run_deepface:
+                    try:
+                        result = DeepFace.analyze(
+                            person_crop,
+                            actions=['age'],
+                            enforce_detection=False,
+                            silent=True
+                        )
+                        age = result[0]['age']
+
+                        if age < AGE_THRESHOLD:
+                            child_detected = True
+                            label = f"CHILD ({int(age)})"
+                            color = (0, 0, 255)
+                        else:
+                            child_detected = False
+                            label = f"ADULT ({int(age)})"
+                            color = (0, 255, 0)
+
+                    except:
+                        child_detected = False
+                        label = f"UNKNOWN {conf:.2f}"
+
+                    age_result_cache[grid_key] = (child_detected, label, color)
+
+                else:
+                    # Reuse the last known result for this position
+                    # instead of re-running DeepFace every frame.
+                    child_detected, label, color = age_result_cache[grid_key]
+
+            cv2.putText(frame, label, (px1, py1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # ---------- COLLECT FOR PER-ZONE COUNTING ----------
+            if child_detected:
+                detected_person_boxes.append((px1, py1, px2, py2))
+
+    # ---------- PER-ZONE PEOPLE-LIMIT CHECK ----------
+    any_zone_exceeded = False
+
+    for zone in zones:
+        current_people = 0
+        for (px1, py1, px2, py2) in detected_person_boxes:
+            if person_in_zone_check(px1, py1, px2, py2, zone):
+                current_people += 1
+
+        max_people = zone.get("maximum_people", 0)
+        zone_exceeded = current_people > max_people
+
+        zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
+
+        if zone_exceeded:
+            any_zone_exceeded = True
+
+            # Draw zone border RED and show LIMIT EXCEEDED
+            draw_shape(frame, zone, (0, 0, 255), 3)
+            cv2.putText(frame, "LIMIT EXCEEDED", (zx1, max(zy1 - 30, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, "!!! ALERT !!!", (50, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        else:
+            # Keep zone border GREEN and show People : current/max
+            draw_shape(frame, zone, (0, 255, 0), 2)
+            cv2.putText(frame, f"People : {current_people}/{max_people}",
+                        (zx1, max(zy1 - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+        # ---------- INCIDENT EVIDENCE (only on actual violation) ----------
+        handle_zone_incident(zone, zone_exceeded, current_people, evidence_frame)
+
+        # Highlight each person's box red/green based on whether their
+        # zone(s) are currently over the limit
+        for (px1, py1, px2, py2) in detected_person_boxes:
+            if person_in_zone_check(px1, py1, px2, py2, zone):
+                box_color = (0, 0, 255) if zone_exceeded else (0, 255, 0)
+                box_thickness = 3 if zone_exceeded else 2
+                cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
+
+    alarm.set(any_zone_exceeded)     # thread-safe + idempotent
+    return frame
+
+
+# ==================== DETECTION WORKER (YOLO IN ITS OWN THREAD) ====================
+#
+# Pipeline:
+#   FrameGrabber thread --newest frame--> DetectionWorker thread --annotated frame--> main/UI thread
+#                       \--newest frame--> IncidentRecorder thread (fixed 20 fps clock)
+#
+# The worker always processes the NEWEST frame and skips any it missed
+# (drop-stale policy) so latency never builds up. The UI thread keeps
+# polling at camera speed, so the window never freezes while YOLO is busy.
+# (cv2.imshow/waitKey must stay on the main thread, so it stays there.)
+
+class DetectionWorker(threading.Thread):
+    def __init__(self, grabber):
+        super().__init__(daemon=True, name="DetectionWorker")
+        self.grabber = grabber
+        self._lock = threading.Lock()
+        self._result = None
+        self._quit = threading.Event()
+
+    def run(self):
+        last_id = -1
+        while not self._quit.is_set():
+            frame_id, raw = self.grabber.wait_for_frame(last_id, timeout=0.5)
+            if raw is None:
+                continue
+            last_id = frame_id
+            if not detection_started:
+                continue
+            try:
+                with processing_lock:
+                    if not detection_started:      # re-check: R may have been pressed
+                        continue
+                    annotated = process_detection_frame(raw, list(ZONES))
+            except Exception as e:
+                print(f"✗ Detection error: {e}")
+                time.sleep(0.2)
+                continue
+            with self._lock:
+                self._result = annotated
+
+    def latest(self):
+        with self._lock:
+            return self._result
+
+    def clear(self):
+        with self._lock:
+            self._result = None
+
+    def stop(self):
+        self._quit.set()
+        self.join(timeout=3)
+
+
+detector = DetectionWorker(grabber)
+detector.start()
+
+
+# -------------------- MAIN LOOP (UI THREAD ONLY) --------------------
+# Grab newest frame -> draw UI -> show -> read keys. No YOLO, no disk I/O
+# for videos, no blocking sound here, so the window stays smooth.
+
+last_frame_id = -1
 
 try:
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        frame_id, raw_frame = grabber.wait_for_frame(last_frame_id, timeout=1.0)
+
+        if raw_frame is None:
+            # Camera stalled / reconnecting - keep the UI alive instead of quitting.
+            waiting = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(waiting, "Waiting for camera...", (150, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            cv2.imshow("Child Safety Detector", waiting)
+            if (cv2.waitKey(1) & 0xFF) == 27:
+                break
+            continue
+
+        last_frame_id = frame_id
+        frame = raw_frame.copy()          # shared frame is read-only; draw on a copy
 
         # Keep the HTML editor's background image close to live.
-        refresh_editor_snapshot(frame)
+        refresh_editor_snapshot(raw_frame)
 
-        # Pick up zone edits saved from zone_editor.html while this script
-        # is already running (throttled internally - see
-        # ZONE_RELOAD_CHECK_SECONDS - so this is cheap to call every frame).
+        # Pick up zone edits saved from zone_editor.html while running.
         check_for_live_zone_updates()
 
         # ========= DRAW MODE =========
@@ -966,157 +1475,12 @@ try:
 
         # ========= DETECTION MODE =========
         else:
-            frame_counter += 1
-            results = model(frame)
-
-            # Clean snapshot of the raw camera frame, taken before any overlays
-            # are drawn, so incident evidence images/video are not cluttered.
-            evidence_frame = frame.copy()
-
-            # Boxes of every valid detected person this frame (for per-zone counting)
-            detected_person_boxes = []
-
-            for r in results:
-                for box in r.boxes:
-                    cls = int(box.cls[0])
-                    if model.names[cls] != "person":
-                        continue
-
-                    px1, py1, px2, py2 = map(int, box.xyxy[0])
-                    conf = float(box.conf[0])
-
-                    # ---------- BASIC CONFIDENCE FILTER ----------
-                    if conf < 0.6:
-                        continue
-
-                    w = px2 - px1
-                    h = py2 - py1
-                    if w == 0 or h == 0:
-                        continue
-
-                    # ---------- ASPECT RATIO FILTER ----------
-                    # Skip the filter for boxes touching the frame edge - they're
-                    # partially cropped, so their aspect ratio is unreliable and
-                    # shouldn't be used to reject a real detection.
-                    frame_h, frame_w = frame.shape[:2]
-                    touches_edge = (px1 <= 1 or py1 <= 1 or
-                                     px2 >= frame_w - 1 or py2 >= frame_h - 1)
-
-                    if not touches_edge:
-                        aspect_ratio = h / w
-                        # Widened lower bound (was 1) so crouching/bending/seated
-                        # people aren't discarded just for being wider than tall.
-                        if aspect_ratio > 4 or aspect_ratio < 0.5:
-                            continue
-
-                    person_crop = frame[py1:py2, px1:px2]
-                    if person_crop.size == 0:
-                        continue
-
-                    # ---------- FACE FILTER (only if age detection is enabled) ----------
-                    if ENABLE_AGE_DETECTION and face_cascade is not None:
-                        gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
-                        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-                        if len(faces) == 0:
-                            continue
-
-                    # ---------- AGE ESTIMATION ----------
-                    child_detected = True  # Default: detect all persons when age detection disabled
-                    color = (0, 255, 0)
-                    label = f"PERSON {conf:.2f}"
-
-                    if ENABLE_AGE_DETECTION:
-                        # Grid cell key for this person's rough position, used to
-                        # cache their last age result between throttled checks.
-                        grid_key = (px1 // AGE_CACHE_GRID, py1 // AGE_CACHE_GRID)
-                        run_deepface = (frame_counter % AGE_CHECK_INTERVAL == 0) or (grid_key not in age_result_cache)
-
-                        if run_deepface:
-                            try:
-                                result = DeepFace.analyze(
-                                    person_crop,
-                                    actions=['age'],
-                                    enforce_detection=False,
-                                    silent=True
-                                )
-                                age = result[0]['age']
-
-                                if age < AGE_THRESHOLD:
-                                    child_detected = True
-                                    label = f"CHILD ({int(age)})"
-                                    color = (0, 0, 255)
-                                else:
-                                    child_detected = False
-                                    label = f"ADULT ({int(age)})"
-                                    color = (0, 255, 0)
-
-                            except:
-                                child_detected = False
-                                label = f"UNKNOWN {conf:.2f}"
-
-                            age_result_cache[grid_key] = (child_detected, label, color)
-
-                        else:
-                            # Reuse the last known result for this position
-                            # instead of re-running DeepFace every frame.
-                            child_detected, label, color = age_result_cache[grid_key]
-
-                    cv2.putText(frame, label, (px1, py1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-                    # ---------- COLLECT FOR PER-ZONE COUNTING ----------
-                    if child_detected:
-                        detected_person_boxes.append((px1, py1, px2, py2))
-
-            # ---------- PER-ZONE PEOPLE-LIMIT CHECK ----------
-            any_zone_exceeded = False
-
-            for zone in ZONES:
-                current_people = 0
-                for (px1, py1, px2, py2) in detected_person_boxes:
-                    if person_in_zone_check(px1, py1, px2, py2, zone):
-                        current_people += 1
-
-                max_people = zone.get("maximum_people", 0)
-                zone_exceeded = current_people > max_people
-
-                zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
-
-                if zone_exceeded:
-                    any_zone_exceeded = True
-
-                    # Draw zone border RED and show LIMIT EXCEEDED
-                    draw_shape(frame, zone, (0, 0, 255), 3)
-                    cv2.putText(frame, "LIMIT EXCEEDED", (zx1, max(zy1 - 30, 15)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    cv2.putText(frame, "!!! ALERT !!!", (50, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-                else:
-                    # Keep zone border GREEN and show People : current/max
-                    draw_shape(frame, zone, (0, 255, 0), 2)
-                    cv2.putText(frame, f"People : {current_people}/{max_people}",
-                                (zx1, max(zy1 - 10, 15)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-
-                # ---------- INCIDENT EVIDENCE (only on actual violation) ----------
-                handle_zone_incident(zone, zone_exceeded, current_people, evidence_frame)
-
-                # Highlight each person's box red/green based on whether their
-                # zone(s) are currently over the limit
-                for (px1, py1, px2, py2) in detected_person_boxes:
-                    if person_in_zone_check(px1, py1, px2, py2, zone):
-                        box_color = (0, 0, 255) if zone_exceeded else (0, 255, 0)
-                        box_thickness = 3 if zone_exceeded else 2
-                        cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
-
-            if any_zone_exceeded:
-                if not alarm_triggered:
-                    play_alarm()
-                    alarm_triggered = True
+            annotated = detector.latest()
+            if annotated is not None:
+                frame = annotated
             else:
-                if alarm_triggered:
-                    stop_alarm()
-                    alarm_triggered = False
+                cv2.putText(frame, "Starting detection...", (150, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         cv2.imshow("Child Safety Detector", frame)
 
@@ -1135,12 +1499,13 @@ try:
 
         # R → Reset zones
         if key == ord('r'):
-            finalize_all_active_incidents()
-            ZONES.clear()
-            _next_zone_id = 1
             detection_started = False
-            alarm_triggered = False
-            stop_alarm()
+            detector.clear()
+            with processing_lock:     # wait for any in-flight frame to finish
+                finalize_all_active_incidents()
+                ZONES.clear()
+            _next_zone_id = 1
+            alarm.set(False)
             save_zones_to_file()
             print("\n✓ Zones reset - draw new zones")
 
@@ -1155,11 +1520,12 @@ finally:
     print("\nShutting down...")
 
     # Close out any incident that was still active when the app was closed
+    detector.stop()
     finalize_all_active_incidents()
-
-    cap.release()
+    recorder.shutdown()          # closes clips + finishes H.264 conversion
+    grabber.stop()
     cv2.destroyAllWindows()
-    stop_alarm()
+    alarm.shutdown()
 
     # Close Arduino connection
     if arduino:

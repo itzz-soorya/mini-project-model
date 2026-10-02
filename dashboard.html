@@ -62,11 +62,14 @@ main{max-width:1320px;margin:-72px auto 0;padding:0 36px 48px;position:relative;
 .chip.on{background:var(--surface);color:var(--ink);box-shadow:0 2px 6px rgba(13,26,44,.12)}
 
 /* cards */
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden;cursor:pointer;transition:transform .18s,box-shadow .18s,border-color .18s}
 .card:hover{transform:translateY(-3px);box-shadow:0 14px 28px rgba(13,26,44,.14);border-color:#c6d0e0}
 .media{position:relative}
 .card .thumb{aspect-ratio:16/9;width:100%;object-fit:cover;display:block;background:#0b1626}
+.card .preview-video{width:100%;aspect-ratio:16/9;display:block;background:#0b1626;border-top:1px solid var(--line);object-fit:contain}
+.card .preview-video:focus-visible{outline:3px solid #8fb0ff;outline-offset:-3px}
+.card .video-unavailable{padding:10px 12px;color:var(--muted);font-size:12px;text-align:center;background:#f4f6fa;border-top:1px solid var(--line)}
 .stamp{position:absolute;left:10px;bottom:10px;background:rgba(11,22,38,.78);backdrop-filter:blur(4px);color:#fff;font-size:12px;font-weight:700;padding:4px 9px;border-radius:8px;font-variant-numeric:tabular-nums}
 .tag{position:absolute;right:10px;top:10px}
 .card .info{padding:14px 16px;display:flex;justify-content:space-between;gap:10px;align-items:center}
@@ -340,7 +343,8 @@ function render() {
     const o = over(i), l = levelOf(o), ok = Math.min(100, i.allowed / (i.people || 1) * 100);
     return `<div class="card" tabindex="0" data-i="${incidents.indexOf(i)}">
       <div class="media"><img class="thumb" loading="lazy" src="${fileUrl('images', i.image)}" alt="Photo of ${esc(i.zone_name)} at ${esc(fmtTime(i.time))}">
-        <span class="stamp">${esc(fmtTime(i.time))}</span><span class="tag">${badge(l)}</span></div>
+        <span class="stamp">${esc(fmtTime(i.time))}</span><span class="tag">${badge(l)}</span>
+        ${i.video ? `<video class="preview-video" controls preload="metadata" poster="${fileUrl('images', i.image)}" aria-label="Video of ${esc(i.zone_name)} at ${esc(fmtTime(i.time))}" src="${fileUrl('videos', i.video)}"></video>` : ''}</div>
       <div class="body"><strong>${esc(i.zone_name)}</strong>
         <div class="count"><b>${i.people}</b> people inside, but only ${i.allowed} allowed</div>
         <div class="meter" role="img" aria-label="${o} people more than allowed"><i class="ok" style="width:${ok}%"></i><i class="bad" style="width:${100 - ok}%"></i></div>
@@ -350,6 +354,19 @@ function render() {
   $('grid').querySelectorAll('.card').forEach(c => {
     const open = () => openViewer(incidents[+c.dataset.i]);
     c.onclick = open;
+    c.querySelectorAll('video').forEach(v => {
+      // Let the native video controls work without opening the modal.
+      v.onclick = e => e.stopPropagation();
+      v.onkeydown = e => e.stopPropagation();
+      v.onerror = () => {
+        v.removeAttribute('src');
+        v.controls = false;
+        v.replaceWith(Object.assign(document.createElement('div'), {
+          className: 'video-unavailable',
+          textContent: 'Video unavailable'
+        }));
+      };
+    });
     c.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
   });
 }

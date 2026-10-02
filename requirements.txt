@@ -26,3 +26,5 @@ python-dotenv>=1.0.0
 # Additional dependencies
 pillow>=10.0.0
 pyyaml>=6.0
+# Converts incident clips to browser-playable H.264 (bundles ffmpeg)
+imageio-ffmpeg>=0.4.9
