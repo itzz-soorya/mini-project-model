@@ -45,12 +45,14 @@ print("=" * 60)
 print("LOADING YOLO MODEL")
 print("=" * 60)
 
-MODEL_PATH = "danger_zone_model.pt"
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "best_final.pt",
+)
 
 if not os.path.exists(MODEL_PATH):
     print(f"✗ Model not found: {MODEL_PATH}")
-    print("\nPlease run 'python train_model.py' first to create the model")
-    print("(Choose option 1 for quick setup with pre-trained model)")
+    print("\nPlease place the trained 'best_final.pt' file in the project folder")
     exit(1)
 
 model = YOLO(MODEL_PATH)

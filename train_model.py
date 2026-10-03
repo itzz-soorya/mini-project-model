@@ -178,8 +178,8 @@ def train_yolo_model(epochs=50, imgsz=640, batch=16):
         if os.path.exists(best_model_path):
             # Copy to root directory for easy access
             import shutil
-            shutil.copy(best_model_path, 'danger_zone_model.pt')
-            print(f"✓ Best model saved to: danger_zone_model.pt")
+            shutil.copy(best_model_path, 'best_final.pt')
+            print(f"✓ Best model saved to: best_final.pt")
         
         print("\nNext step:")
         print("Run 'python detect_danger_zone.py' to start detection")
