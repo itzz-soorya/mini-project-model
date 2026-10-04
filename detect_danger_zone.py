@@ -17,6 +17,7 @@ import queue
 import shutil
 import subprocess
 import threading
+from collections import deque
 import numpy as np
 from deepface import DeepFace
 
@@ -252,12 +253,26 @@ frame_counter = 0
 AGE_CACHE_GRID = 80  # pixels per grid cell
 age_result_cache = {}
 
+# -------------------- BYTETRACK + TEMPORAL VALIDATION SETTINGS --------------------
+# ByteTrack (built into Ultralytics) gives every person a persistent track ID,
+# so a person is counted once, no matter how many frames they appear in.
+TRACKER_CONFIG = "bytetrack.yaml"
+TRACK_CONF = 0.6                  # confidence passed to model.track()
+
+# A zone violation must hold for this many CONSECUTIVE PROCESSED frames before
+# it is confirmed (alarm + evidence). A shorter blip is ignored (false-alarm
+# filter). Note: "processed" frames = frames the detector actually handled,
+# so the real time is TEMPORAL_CONFIRM_FRAMES / detector FPS seconds.
+TEMPORAL_CONFIRM_FRAMES = 5
+
 print("\n" + "=" * 60)
 print("CONFIGURATION")
 print("=" * 60)
 print(f"Age detection: {'ENABLED' if ENABLE_AGE_DETECTION else 'DISABLED'}")
 print(f"Age threshold: {AGE_THRESHOLD} years")
 print(f"Face filter: {'ENABLED' if face_cascade is not None else 'DISABLED'}")
+print(f"Tracker: {TRACKER_CONFIG} (conf={TRACK_CONF})")
+print(f"Temporal confirmation: {TEMPORAL_CONFIRM_FRAMES} consecutive frames")
 print("=" * 60)
 
 # -------------------- ZONE DRAWING --------------------
@@ -340,6 +355,7 @@ def check_for_live_zone_updates():
     with processing_lock:      # don't swap zones while the worker is mid-frame
         finalize_all_active_incidents()
         load_zones_from_file()
+        reset_zone_streaks()   # zone ids may now mean something else
     print("↻ zones.json changed on disk - live-reloaded zones")
 
 
@@ -858,6 +874,15 @@ def person_in_zone_check(px1, py1, px2, py2, zone):
 
 RECORD_FPS = 20.0
 
+# PRE-BUFFERED EVIDENCE: the recorder keeps the last PRE_BUFFER_SECONDS of
+# video in memory at all times. When a violation is confirmed the saved clip
+# starts with that buffer, so the clip shows the moment people ENTERED the
+# zone, not just the moment the (delayed) confirmation fired.
+# Memory use ~= PRE_BUFFER_SECONDS * RECORD_FPS * one frame (a 640x480 frame
+# is ~0.9 MB, so 3 s ~= 55 MB; a 1080p frame is ~6 MB, so 3 s ~= 370 MB).
+# Set to 0 to disable pre-buffering.
+PRE_BUFFER_SECONDS = 3.0
+
 # One lock protects "evaluate zones + start/stop incidents", so the YOLO
 # worker, zone hot-reload and the R-reset can never interleave.
 processing_lock = threading.Lock()
@@ -880,7 +905,14 @@ print("✓ ffmpeg found - clips will be browser-playable H.264" if FFMPEG_EXE el
 
 
 def open_video_writer(path, fps, size):
-    for codec in ("avc1", "H264", "mp4v"):
+    # The hardware/software H.264 encoders OpenCV tries first ("avc1", "H264")
+    # need a matching libopenh264 DLL; on many Windows installs the DLL
+    # version is wrong, which prints "Incorrect library version loaded" and
+    # "Failed to initialize VideoWriter" before falling back. If ffmpeg is
+    # available we skip those attempts: record with mp4v and let
+    # transcode_to_h264() convert the finished clip to browser-playable H.264.
+    codecs = ("mp4v",) if FFMPEG_EXE else ("avc1", "H264", "mp4v")
+    for codec in codecs:
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*codec), fps, size)
         if writer.isOpened():
             return writer, codec
@@ -913,7 +945,12 @@ class IncidentRecorder(threading.Thread):
         super().__init__(daemon=True, name="IncidentRecorder")
         self.grabber = grabber
         self.fps = fps
-        self._clips = {}                 # key -> {"writer", "path", "codec"}
+        self._clips = {}                 # key -> {"writer", "path", "codec", "size", "backlog"}
+        # Rolling pre-buffer of the most recent frames, sampled on the same
+        # fixed fps clock as the recording, so replaying it is real-time.
+        # Frames are stored by reference (the grabber allocates a new array
+        # per read and never modifies an old one), so appending is cheap.
+        self._prebuffer = deque(maxlen=max(0, int(PRE_BUFFER_SECONDS * fps)))
         self._lock = threading.Lock()
         self._quit = threading.Event()
         self._post = []                  # background transcode threads
@@ -929,11 +966,25 @@ class IncidentRecorder(threading.Thread):
             return False
         with self._lock:
             old = self._clips.pop(key, None)
-            self._clips[key] = {"writer": writer, "path": path, "codec": codec}
-            writer.write(frame)
+            # Backlog = the pre-buffered frames (oldest first). The recorder
+            # thread writes them into the clip BEFORE any live frame, so the
+            # video starts PRE_BUFFER_SECONDS before the confirmation. If the
+            # buffer is empty (just started / disabled) fall back to the
+            # current frame, as before.
+            backlog = list(self._prebuffer) or [frame]
+            self._clips[key] = {"writer": writer, "path": path, "codec": codec,
+                                "size": (w, h), "backlog": backlog}
         if old:
             self._finish(old)
         return True
+
+    @staticmethod
+    def _write_frame(clip, frame):
+        """Write one frame, skipping any whose size differs from the clip
+        (e.g. the camera reconnected at another resolution)."""
+        h, w = frame.shape[:2]
+        if (w, h) == clip["size"]:
+            clip["writer"].write(frame)
 
     def stop_clip(self, key):
         with self._lock:
@@ -959,8 +1010,18 @@ class IncidentRecorder(threading.Thread):
             _, frame = self.grabber.latest()
             if frame is not None:
                 with self._lock:
+                    # Write each active clip's pre-buffered backlog first
+                    # (older frames), then this tick's live frame.
                     for clip in self._clips.values():
-                        clip["writer"].write(frame)       # read-only use of shared frame
+                        if clip["backlog"]:
+                            for old_frame in clip["backlog"]:
+                                self._write_frame(clip, old_frame)
+                            clip["backlog"] = []
+                        self._write_frame(clip, frame)    # read-only use of shared frame
+                    # Remember this frame for future pre-rolls (after the
+                    # clips were written, so it is never written twice).
+                    if self._prebuffer.maxlen:
+                        self._prebuffer.append(frame)
             delay = next_tick - time.perf_counter()
             if delay > 0:
                 self._quit.wait(delay)
@@ -996,6 +1057,10 @@ CSV_FIELDNAMES = [
 # Per-zone incident state, keyed by zone id. Only populated once a zone's
 # FIRST violation happens.
 zone_incident_state = {}
+
+# Temporal validation state, kept SEPARATELY for every zone: zone id -> number
+# of consecutive processed frames in which that zone was over its limit.
+zone_violation_streak = {}
 
 
 def get_zone_display_name(zone):
@@ -1217,20 +1282,53 @@ def finalize_all_active_incidents():
             finalize_incident(zone_id)
 
 
+def reset_zone_streaks():
+    """Forget all temporal-validation progress (zones changed / detection restarted)."""
+    zone_violation_streak.clear()
+
+
+def reset_tracker():
+    """Forget every ByteTrack track so person IDs start fresh. Called when
+    detection (re)starts, so stale tracks from before a pause can't be
+    matched to new people."""
+    try:
+        predictor = getattr(model, "predictor", None)
+        for tracker in (getattr(predictor, "trackers", None) or []):
+            tracker.reset()
+    except Exception as e:
+        print(f"⚠ Could not reset tracker: {e}")
+
+
 def process_detection_frame(raw_frame, zones):
     """Runs in the DetectionWorker thread. raw_frame is shared/read-only;
-    returns a NEW annotated frame."""
+    returns a NEW annotated frame.
+
+    Pipeline:
+      YOLOv8 -> ByteTrack (persistent IDs) -> zone check -> unique-ID
+      occupancy -> temporal validation -> confirmed violation
+      -> alarm + image + video + CSV (existing incident system)."""
     global frame_counter
     frame = raw_frame.copy()
     frame_counter += 1
-    results = model(frame, verbose=False)
+
+    # ---------- YOLOv8 + BYTETRACK ----------
+    # model.track() runs detection and then ByteTrack. persist=True keeps the
+    # tracker state between calls so IDs survive from frame to frame.
+    results = model.track(
+        frame,
+        persist=True,
+        tracker=TRACKER_CONFIG,
+        conf=TRACK_CONF,
+        verbose=False,
+    )
 
     # Clean snapshot of the raw camera frame, taken before any overlays
     # are drawn, so incident evidence images/video are not cluttered.
     evidence_frame = raw_frame   # untouched copy for evidence
 
-    # Boxes of every valid detected person this frame (for per-zone counting)
-    detected_person_boxes = []
+    # Valid TRACKED persons this frame: (x1, y1, x2, y2, track_id).
+    # Detections without a track ID are never counted (see below).
+    tracked_persons = []
 
     for r in results:
         for box in r.boxes:
@@ -1269,6 +1367,13 @@ def process_detection_frame(raw_frame, zones):
             if person_crop.size == 0:
                 continue
 
+            # ---------- BYTETRACK ID ----------
+            # box.id is None when the tracker has not (yet) confirmed this
+            # detection as a track. Such a box is still drawn, but it is NOT
+            # counted, so a brand-new/flickering detection cannot inflate
+            # the occupancy.
+            track_id = int(box.id[0]) if box.id is not None else None
+
             # ---------- FACE FILTER (only if age detection is enabled) ----------
             if ENABLE_AGE_DETECTION and face_cascade is not None:
                 gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
@@ -1279,7 +1384,10 @@ def process_detection_frame(raw_frame, zones):
             # ---------- AGE ESTIMATION ----------
             child_detected = True  # Default: detect all persons when age detection disabled
             color = (0, 255, 0)
-            label = f"PERSON {conf:.2f}"
+            if track_id is not None:
+                label = f"Person ID {track_id} | {conf:.2f}"
+            else:
+                label = f"PERSON {conf:.2f}"
 
             if ENABLE_AGE_DETECTION:
                 # Grid cell key for this person's rough position, used to
@@ -1317,29 +1425,56 @@ def process_detection_frame(raw_frame, zones):
                     # instead of re-running DeepFace every frame.
                     child_detected, label, color = age_result_cache[grid_key]
 
+                if track_id is not None:
+                    label = f"ID {track_id} | {label}"
+
             cv2.putText(frame, label, (px1, py1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             # ---------- COLLECT FOR PER-ZONE COUNTING ----------
-            if child_detected:
-                detected_person_boxes.append((px1, py1, px2, py2))
+            # Only persons that have a valid ByteTrack ID are counted.
+            if child_detected and track_id is not None:
+                tracked_persons.append((px1, py1, px2, py2, track_id))
 
-    # ---------- PER-ZONE PEOPLE-LIMIT CHECK ----------
-    any_zone_exceeded = False
+    # ---------- PER-ZONE OCCUPANCY + TEMPORAL VALIDATION ----------
+    any_zone_confirmed = False
+
+    # Drop streaks of zones that no longer exist (zone deleted / edited).
+    live_zone_ids = {z.get("id") for z in zones}
+    for stale_id in [k for k in zone_violation_streak if k not in live_zone_ids]:
+        del zone_violation_streak[stale_id]
 
     for zone in zones:
-        current_people = 0
-        for (px1, py1, px2, py2) in detected_person_boxes:
-            if person_in_zone_check(px1, py1, px2, py2, zone):
-                current_people += 1
+        zone_id = zone.get("id")
 
+        # Unique-ID occupancy: the SET guarantees that one tracked person is
+        # counted once, even if several boxes carried the same ID.
+        inside_ids = set()
+        inside_boxes = []
+        for (px1, py1, px2, py2, track_id) in tracked_persons:
+            if person_in_zone_check(px1, py1, px2, py2, zone):
+                inside_ids.add(track_id)
+                inside_boxes.append((px1, py1, px2, py2))
+
+        current_people = len(inside_ids)
         max_people = zone.get("maximum_people", 0)
-        zone_exceeded = current_people > max_people
+        over_limit_now = current_people > max_people      # single-frame check
+
+        # Temporal validation (per zone): count consecutive over-limit frames.
+        # Any frame at/below the limit resets the streak to 0.
+        if over_limit_now:
+            streak = zone_violation_streak.get(zone_id, 0) + 1
+        else:
+            streak = 0
+        zone_violation_streak[zone_id] = streak
+
+        zone_confirmed = streak >= TEMPORAL_CONFIRM_FRAMES   # CONFIRMED violation
+        zone_pending = over_limit_now and not zone_confirmed # over limit, still verifying
 
         zx1, zy1, zx2, zy2 = zone_bounding_box(zone)
 
-        if zone_exceeded:
-            any_zone_exceeded = True
+        if zone_confirmed:
+            any_zone_confirmed = True
 
             # Draw zone border RED and show LIMIT EXCEEDED
             draw_shape(frame, zone, (0, 0, 255), 3)
@@ -1347,6 +1482,15 @@ def process_detection_frame(raw_frame, zones):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             cv2.putText(frame, "!!! ALERT !!!", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        elif zone_pending:
+            # Over the limit but not yet confirmed: yellow, no alarm/evidence.
+            draw_shape(frame, zone, (0, 255, 255), 2)
+            cv2.putText(frame, f"VERIFYING {streak}/{TEMPORAL_CONFIRM_FRAMES}",
+                        (zx1, max(zy1 - 30, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, f"People : {current_people}/{max_people}",
+                        (zx1, max(zy1 - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
         else:
             # Keep zone border GREEN and show People : current/max
             draw_shape(frame, zone, (0, 255, 0), 2)
@@ -1354,18 +1498,23 @@ def process_detection_frame(raw_frame, zones):
                         (zx1, max(zy1 - 10, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-        # ---------- INCIDENT EVIDENCE (only on actual violation) ----------
-        handle_zone_incident(zone, zone_exceeded, current_people, evidence_frame)
+        # ---------- INCIDENT EVIDENCE (only on a CONFIRMED violation) ----------
+        # The existing start / continue / finalize logic is unchanged; it is
+        # just fed the temporally confirmed flag instead of the raw one.
+        handle_zone_incident(zone, zone_confirmed, current_people, evidence_frame)
 
-        # Highlight each person's box red/green based on whether their
-        # zone(s) are currently over the limit
-        for (px1, py1, px2, py2) in detected_person_boxes:
-            if person_in_zone_check(px1, py1, px2, py2, zone):
-                box_color = (0, 0, 255) if zone_exceeded else (0, 255, 0)
-                box_thickness = 3 if zone_exceeded else 2
-                cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
+        # Highlight each counted person's box: red = confirmed violation,
+        # yellow = verifying, green = OK.
+        if zone_confirmed:
+            box_color, box_thickness = (0, 0, 255), 3
+        elif zone_pending:
+            box_color, box_thickness = (0, 255, 255), 2
+        else:
+            box_color, box_thickness = (0, 255, 0), 2
+        for (px1, py1, px2, py2) in inside_boxes:
+            cv2.rectangle(frame, (px1, py1), (px2, py2), box_color, box_thickness)
 
-    alarm.set(any_zone_exceeded)     # thread-safe + idempotent
+    alarm.set(any_zone_confirmed)     # alarm only on CONFIRMED violations
     return frame
 
 
@@ -1495,6 +1644,9 @@ try:
         # ENTER → Confirm zones
         if key == 13 and not detection_started:
             if len(ZONES) > 0:
+                with processing_lock:          # fresh IDs + fresh streaks on start
+                    reset_tracker()
+                    reset_zone_streaks()
                 detection_started = True
                 save_zones_to_file()
                 print(f"\n✓ Detection started with {len(ZONES)} danger zone(s)")
@@ -1506,6 +1658,8 @@ try:
             with processing_lock:     # wait for any in-flight frame to finish
                 finalize_all_active_incidents()
                 ZONES.clear()
+                reset_zone_streaks()
+                reset_tracker()
             _next_zone_id = 1
             alarm.set(False)
             save_zones_to_file()
