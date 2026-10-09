@@ -58,6 +58,7 @@ if not os.path.exists(MODEL_PATH):
 
 model = YOLO(MODEL_PATH)
 print(f"✓ Model loaded successfully: {MODEL_PATH}")
+print(f"Model classes: {model.names}")
 print("=" * 60)
 
 # -------------------- LOAD FACE CASCADE SAFELY --------------------
@@ -95,23 +96,47 @@ else:
 #   slow consumer can never back up the camera. A Condition variable lets
 #   consumers sleep until a new frame really arrives (no busy-waiting).
 
+USE_VIDEO_FILE = True  # True: use VIDEO_FILE; False: use the webcam
 CAMERA_INDEX = 0
+VIDEO_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "VIRAT_S_000200_00_000100_000171.mp4",
+)
+INPUT_SOURCE = VIDEO_FILE if USE_VIDEO_FILE else CAMERA_INDEX
 
 
 class FrameGrabber(threading.Thread):
-    def __init__(self, source=CAMERA_INDEX):
+    def __init__(self, source=INPUT_SOURCE):
         super().__init__(daemon=True, name="FrameGrabber")
         self.source = source
+        self._is_file = isinstance(source, (str, bytes, os.PathLike))
         self._cond = threading.Condition()
         self._frame = None
         self._frame_id = 0
         self._quit = threading.Event()
+        self._end_of_stream = threading.Event()
         self.cap = self._open()
+        file_fps = (self.cap.get(cv2.CAP_PROP_FPS)
+                    if self.cap is not None and self._is_file else 0.0)
+        self._file_fps = file_fps if file_fps > 0 else 25.0
+        self._next_file_frame_time = time.perf_counter()
 
     def _open(self):
-        """Try several Windows camera backends and accept the first one that
-        actually DELIVERS a frame (isOpened() alone can be True even when the
-        backend never produces video - that was the "no frames" error)."""
+        """Open a video file directly or try the available webcam backends."""
+        if self._is_file:
+            if not os.path.isfile(self.source):
+                print(f"✗ Video file not found: {self.source}")
+                return None
+
+            cap = cv2.VideoCapture(self.source)
+            if not cap.isOpened():
+                cap.release()
+                print(f"✗ Could not open video file: {self.source}")
+                return None
+
+            print(f"✓ Video file opened: {self.source}")
+            return cap
+
         if os.name == "nt":
             # DirectShow is more reliable for this threaded capture loop.
             # CAP_ANY may select MSMF and stop delivering frames after the
@@ -160,6 +185,15 @@ class FrameGrabber(threading.Thread):
 
             ok, frame = self.cap.read()
             if not ok:
+                if self._is_file:
+                    print(f"✓ Video file playback finished: {self.source}")
+                    self.cap.release()
+                    self.cap = None
+                    self._end_of_stream.set()
+                    with self._cond:
+                        self._cond.notify_all()
+                    break
+
                 fails += 1
                 if fails >= 30:                        # ~1s of failures = camera dropped
                     print("⚠ Camera stopped delivering frames - reconnecting...")
@@ -175,13 +209,24 @@ class FrameGrabber(threading.Thread):
                 self._frame_id += 1
                 self._cond.notify_all()
 
+            if self._is_file:
+                self._next_file_frame_time += 1.0 / self._file_fps
+                delay = self._next_file_frame_time - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+
+    @property
+    def end_of_stream(self):
+        return self._end_of_stream.is_set()
+
     def wait_for_frame(self, last_id, timeout=1.0):
         """Block until a frame NEWER than last_id exists. Returns (id, frame)
         or (last_id, None) on timeout. Frame is shared - copy() before drawing."""
         with self._cond:
             self._cond.wait_for(
                 lambda: (self._frame is not None and
-                         self._frame_id != last_id) or self._quit.is_set(),
+                         self._frame_id != last_id) or
+                        self._quit.is_set() or self._end_of_stream.is_set(),
                 timeout)
             if self._frame is None or self._frame_id == last_id:
                 return last_id, None
@@ -200,23 +245,33 @@ class FrameGrabber(threading.Thread):
             self.cap.release()
 
 
-grabber = FrameGrabber(CAMERA_INDEX)
+grabber = FrameGrabber(INPUT_SOURCE)
 
 if grabber.cap is None:
-    print("✗ Error: Could not open camera")
-    print("  - Close any other program using the camera (an old detect_danger_zone.py, Zoom, Teams, Camera app)")
-    print("  - Windows Settings > Privacy > Camera > allow desktop apps")
-    print("  - Try CAMERA_INDEX = 1")
+    if USE_VIDEO_FILE:
+        print(f"✗ Error: Could not open video file: {VIDEO_FILE}")
+        print("  - Check that the file exists and is a supported video format")
+    else:
+        print("✗ Error: Could not open camera")
+        print("  - Close any other program using the camera (an old detect_danger_zone.py, Zoom, Teams, Camera app)")
+        print("  - Windows Settings > Privacy > Camera > allow desktop apps")
+        print("  - Try CAMERA_INDEX = 1")
     exit(1)
 
 grabber.start()
 _first_id, _first_frame = grabber.wait_for_frame(-1, timeout=15.0)
 if _first_frame is None:
-    print("✗ Error: Camera opened but delivered no frames")
+    if USE_VIDEO_FILE and grabber.end_of_stream:
+        print(f"✗ Error: Video file contains no readable frames: {VIDEO_FILE}")
+    elif USE_VIDEO_FILE:
+        print(f"✗ Error: Video file opened but delivered no frames: {VIDEO_FILE}")
+    else:
+        print("✗ Error: Camera opened but delivered no frames")
     grabber.stop()
     exit(1)
 
-print("✓ Camera initialized (threaded capture)")
+print("✓ Video input initialized (threaded capture)" if USE_VIDEO_FILE
+      else "✓ Camera initialized (threaded capture)")
 
 # The HTML zone editor displays this file as its background so you can draw
 # zones on top of it. It's refreshed periodically from inside the main loop
@@ -257,7 +312,9 @@ age_result_cache = {}
 # ByteTrack (built into Ultralytics) gives every person a persistent track ID,
 # so a person is counted once, no matter how many frames they appear in.
 TRACKER_CONFIG = "bytetrack.yaml"
-TRACK_CONF = 0.6                  # confidence passed to model.track()
+TRACK_CONF = 0.25                 # confidence passed to model.track() (low: far-away people score low)
+TRACK_IMGSZ = 1280                # inference size; small/distant people need > 640 (use 960 if CPU is slow)
+COUNT_UNTRACKED = True            # count a detection even before ByteTrack has given it an ID
 
 # A zone violation must hold for this many CONSECUTIVE PROCESSED frames before
 # it is confirmed (alarm + evidence). A shorter blip is ignored (false-alarm
@@ -1319,6 +1376,7 @@ def process_detection_frame(raw_frame, zones):
         persist=True,
         tracker=TRACKER_CONFIG,
         conf=TRACK_CONF,
+        imgsz=TRACK_IMGSZ,
         verbose=False,
     )
 
@@ -1333,15 +1391,11 @@ def process_detection_frame(raw_frame, zones):
     for r in results:
         for box in r.boxes:
             cls = int(box.cls[0])
-            if model.names[cls] != "person":
+            if str(model.names[cls]).lower() != "person":
                 continue
 
             px1, py1, px2, py2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
-
-            # ---------- BASIC CONFIDENCE FILTER ----------
-            if conf < 0.6:
-                continue
 
             w = px2 - px1
             h = py2 - py1
@@ -1428,13 +1482,19 @@ def process_detection_frame(raw_frame, zones):
                 if track_id is not None:
                     label = f"ID {track_id} | {label}"
 
+            cv2.rectangle(frame, (px1, py1), (px2, py2), color, 1)
             cv2.putText(frame, label, (px1, py1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             # ---------- COLLECT FOR PER-ZONE COUNTING ----------
             # Only persons that have a valid ByteTrack ID are counted.
-            if child_detected and track_id is not None:
-                tracked_persons.append((px1, py1, px2, py2, track_id))
+            if child_detected:
+                if track_id is not None:
+                    tracked_persons.append((px1, py1, px2, py2, track_id))
+                elif COUNT_UNTRACKED:
+                    # No ByteTrack ID yet (first frames / after dropped frames):
+                    # use a unique negative id so the person is still counted once.
+                    tracked_persons.append((px1, py1, px2, py2, -(len(tracked_persons) + 1)))
 
     # ---------- PER-ZONE OCCUPANCY + TEMPORAL VALIDATION ----------
     any_zone_confirmed = False
@@ -1457,7 +1517,7 @@ def process_detection_frame(raw_frame, zones):
                 inside_boxes.append((px1, py1, px2, py2))
 
         current_people = len(inside_ids)
-        max_people = zone.get("maximum_people", 0)
+        max_people = int(zone.get("maximum_people", 0))
         over_limit_now = current_people > max_people      # single-frame check
 
         # Temporal validation (per zone): count consecutive over-limit frames.
@@ -1542,6 +1602,8 @@ class DetectionWorker(threading.Thread):
         while not self._quit.is_set():
             frame_id, raw = self.grabber.wait_for_frame(last_id, timeout=0.5)
             if raw is None:
+                if self.grabber.end_of_stream:
+                    break
                 continue
             last_id = frame_id
             if not detection_started:
@@ -1586,9 +1648,14 @@ try:
         frame_id, raw_frame = grabber.wait_for_frame(last_frame_id, timeout=1.0)
 
         if raw_frame is None:
+            if grabber.end_of_stream:
+                print("✓ Video input reached end of file.")
+                break
+
             # Camera stalled / reconnecting - keep the UI alive instead of quitting.
             waiting = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(waiting, "Waiting for camera...", (150, 240),
+            waiting_message = "Waiting for camera..." if not USE_VIDEO_FILE else "Waiting for video..."
+            cv2.putText(waiting, waiting_message, (150, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
             cv2.imshow("Child Safety Detector", waiting)
             if (cv2.waitKey(1) & 0xFF) == 27:
